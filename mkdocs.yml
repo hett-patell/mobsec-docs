@@ -11,26 +11,30 @@ use_directory_urls: true
 theme:
   name: material
   language: en
+  font:
+    text: Inter
+    code: JetBrains Mono
   palette:
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
-      primary: indigo
-      accent: amber
+      primary: custom
+      accent: custom
       toggle:
         icon: material/weather-sunny
-        name: Light
+        name: Switch to light mode
     - media: "(prefers-color-scheme: light)"
       scheme: default
-      primary: indigo
-      accent: amber
+      primary: custom
+      accent: custom
       toggle:
         icon: material/weather-night
-        name: Dark
+        name: Switch to dark mode
   features:
-    - navigation.tabs
-    - navigation.tabs.sticky
     - navigation.sections
+    - navigation.expand
     - navigation.indexes
+    - navigation.path
+    - navigation.footer
     - navigation.top
     - navigation.tracking
     - toc.follow
@@ -41,6 +45,7 @@ theme:
     - content.code.annotate
     - content.tabs.link
   icon:
+    logo: material/shield-lock-outline
     repo: fontawesome/brands/git-alt
 
 markdown_extensions:
