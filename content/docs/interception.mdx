@@ -1,0 +1,94 @@
+---
+title: "HTTPS interception"
+---
+
+The goal is boring reliability: every app on the device, including Play Store and GMS, decrypts through mitmproxy, and apps that pin certificates still connect.
+
+## The chain
+
+<Mermaid chart={`flowchart LR
+    A[app] -->|CONNECT :18080| B[adb reverse tunnel]
+    B --> C[mitmdump :18080<br/>mitm/dump.py]
+    C --> D[upstream]
+    C -->|mitmproxy CA| A
+    E[Cert-Fixer<br/>post-fs-data] -.->|bind-mount CA| F[/apex/…/conscrypt/cacerts/]
+    F -.->|trust store| A`} />
+
+1. **`adb reverse tcp:18080 tcp:18080`** — device port 18080 is the host's mitmdump. Survives nothing; re-established by `nettap on`.
+2. **Global proxy** `127.0.0.1:18080` (optional once `fspawn intercept` is in play).
+3. **CA trust** — the mitmproxy CA is installed as a *user* CA (`/data/misc/user/0/cacerts-added/<hash>.0`) and then mounted into the system trust store by **Cert-Fixer** at boot.
+4. **Capture** — `mitm/dump.py` writes one file per interesting flow.
+
+## The CA, exactly
+
+```bash
+# hash used by the Android trust store (old subject hash, not the new one)
+openssl x509 -inform PEM -subject_hash_old -in ~/.mitmproxy/mitmproxy-ca-cert.pem | head -1
+# c8750f0d
+```
+
+Installed at `/data/misc/user/0/cacerts-added/c8750f0d.0`; Cert-Fixer copies and bind-mounts it into `/apex/com.android.conscrypt/cacerts` for every process, and does the same inside PID 1's mount namespace so late-started system services inherit it.
+
+Verify for a specific process:
+
+```bash
+PID=$(adb shell pidof com.google.android.gms | tr -d '\r')
+adb shell su -c "nsenter --mount=/proc/$PID/ns/mnt -- ls /apex/com.android.conscrypt/cacerts | wc -l"   # 150
+adb shell su -c "nsenter --mount=/proc/$PID/ns/mnt -- ls /apex/com.android.conscrypt/cacerts/c8750f0d.0"
+```
+
+<Callout type="info" title="Why AlwaysTrustUserCerts was not enough">
+That module only mounts in `service.sh`, i.e. **after** GMS and Play Store have already started, so they kept their original trust store and failed with `Client TLS handshake failed … does not trust the proxy's certificate for play-fe.googleapis.com`. Cert-Fixer hooks `post-fs-data` instead. It is installed, `trustusercerts` is disabled via `touch /data/adb/modules/trustusercerts/disable`.
+</Callout>
+
+
+## Pinning
+
+Two independent mechanisms, both from HTTP Toolkit's Frida scripts (`frida/httptoolkit/`), loaded by `fspawn <pkg> intercept`:
+
+- **`android-certificate-unpinning.js`** — hooks `TrustManagerImpl`, `OkHttp CertificatePinner`, `X509TrustManager` wrappers, Conscrypt and a long list of third-party pinning libraries, and makes them accept anything.
+- **`android-certificate-unpinning-fallback.js`** — a second pass that patches classes *after* they load, for apps that cache their trust managers early.
+
+Plus two scripts that make interception work without a system proxy:
+
+- **`android-proxy-override.js`** — rewrites `System.getProperty("http.proxyHost")`, `ConnectivityManager.getDefaultProxy()` and OkHttp's proxy selector.
+- **`native-connect-hook.js` / `native-tls-hook.js`** — LD_PRELOAD-style hooks (`connect`, `getaddrinfo`, `SSL_*`) so native code (Rust/Flutter/Go) also goes through the proxy and trusts our CA.
+
+Proof, reproducible on this device:
+
+```bash
+fspawn tech.httptoolkit.pinning_demo intercept
+# tap "OkHTTP pinned request" → the app reports success, and the flow shows up:
+# GET https://rsa8192--untrusted-root.testserver.host/ HTTP/2.0
+```
+
+Without the profile the same button says **Failed** and no flow appears.
+
+## What still resists
+
+| Case | Symptom | Workaround |
+|---|---|---|
+| Certificate **transparency** enforcement | `SSL handshake failed` inside a pinned library, even with unpinning | Not solved here; needs a CT-aware proxy or hooking the CT verifier (`--ct` hooks in some forks) |
+| Mutual TLS with a hardware key | login fails at the TLS layer | Keys live in TEE; only TrickyStore-style keystore spoofing can help, and only for attestation, not arbitrary mTLS |
+| QUIC / HTTP/3 | app works, nothing captured | Disable QUIC in the app or block UDP 443 on the device; mitmproxy does not proxy QUIC |
+| WebSocket over `wss` | decrypted once upgraded | mitmproxy captures the upgrade; use the addon's `websocket_message` hook if you need frames |
+| Apps that pin inside a **WebView WebAssembly** module | nothing in Java hooks fires | hook the WebView's network stack (`fspawn web`) or fall back to `replay` with harvested tokens |
+
+## The addon
+
+```bash
+cat ~/mobsec/mitm/dump.py
+```
+
+- `FLOWDIR` (default `/tmp/mtflows`), `INTEREST` (only matching URLs), `IGNORE` (default drops googleapis/gstatic/ggbn/firebase/app-measurement/crashlytics noise), `MAXBODY` (20000 bytes per body).
+- Output `<HHMMSS>_<host>_<path>.txt`, plus `_index.log` (human) and `_index.jsonl` (machine).
+- Restart after editing: `nettap off && nettap on`. mitmproxy does **not** hot-reload addons.
+
+## Sanity checks that catch most "interception is broken" reports
+
+```bash
+pentestctl status | sed -n '/interception/,$p'
+curl -s -x 127.0.0.1:18080 -o /dev/null -w '%{http_code}\n' https://example.org   # 200
+grep -c 'does not trust the proxy' /tmp/mitm.log                                   # want 0 for GMS
+ls -t /tmp/mtflows/*.txt | head -3
+```

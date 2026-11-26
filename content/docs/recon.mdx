@@ -1,0 +1,88 @@
+---
+title: "Static recon"
+---
+
+Dynamic testing tells you what the app *did*; static testing tells you what it *can* do. `recon` runs the static pass in one command and produces a report you can read in two minutes.
+
+## Usage
+
+```bash
+recon /path/to/app.apk
+recon com.example.app --deep        # pulls base.apk from the device, then decompiles
+recon app.apk -o /tmp/out
+```
+
+Output:
+
+```text
+~/.mobsec/recon/<pkg>-<timestamp>/
+├── report.md            <- read this
+├── app.apk
+└── raw/
+    ├── badging.txt      aapt2 dump badging
+    ├── manifest.xml     apkanalyzer manifest print
+    ├── apkid.txt        packers / obfuscators / anti-analysis
+    ├── apkleaks.json    secrets + endpoints (+ .log)
+    ├── mobsfscan.json   SAST rules
+    └── endpoints.txt    only with --deep (jadx + grep)
+```
+
+## What the report contains, and how to read it
+
+### Exported components
+The attack surface that does not require the app to be running. For each component: `permission`, `actions`, `categories`, `data` (scheme/host/path/mime). Anything exported without a signature-level permission is worth a `adb shell am start` / `am broadcast` probe.
+
+### Packers / anti-analysis (APKiD)
+Read this with suspicion. APKiD matches library code too:
+
+| Tag | Meaning | What to do |
+|---|---|---|
+| `packer: …` | packer/obfuscator heuristic | decide whether to test the packed layer or the loader |
+| `anti_vm` / `anti_debug` | emulator/debugger checks | **verify by reading the class** before believing it |
+| `compiler: unknown` | not a real finding | ignore |
+
+Concrete example from this rig: Target was tagged `anti_vm` + `packer: DexGuard`, and every hit turned out to be library code:
+
+- `W0/c.java` → Firebase CCT metadata (`sdk-version`, `Build.MODEL`, `Build.FINGERPRINT`)
+- `p003a2/v.java` → Material `MaterialAutoCompleteTextView` (a Meizu hint workaround)
+- `p045n1/k.java` → GMS `DialogRedirect` logging
+- `p019g/A.java` → `!"robolectric".equals(Build.FINGERPRINT)`
+
+So: no app-level emulator check in the DEX. The `DexGuard` tag was R8 single-letter-package confusion. Ten minutes of reading beat a day of chasing a phantom.
+
+### Secrets / endpoints (apkleaks)
+Categories with hit counts. Triage rules:
+
+- `Google_API_Key` / `Firebase` keys are **usually not secrets** — they are restricted by package name + SHA-1. Report only if a restriction test shows otherwise.
+- Random 30–40 char strings tagged `Artifactory_Password` are frequently obfuscation noise; grep the decompiled tree for the value before writing a finding.
+- Version strings (`1.0.0.2`) match `IP_Address`; ignore.
+- Real finds look like: hardcoded bearer tokens, private endpoints, staging hosts, cloud storage buckets.
+
+### SAST (mobsfscan)
+Rule-based Android checks (exported components, weak crypto, WebView settings, backup flags…). Fast, noisy, useful as a checklist. Zero findings is a valid result — not proof of safety.
+
+### Deep mode
+`--deep` decompiles with jadx (1.5.7) and greps string literals for URLs, then writes `endpoints.txt`. Use it to build the API list before you even launch the app; combine with the captured flows later.
+
+## A realistic order of operations
+
+1. `recon com.example.app --deep` — components, permissions, endpoints, secrets.
+2. Note the **exported** components and any endpoint that looks internal (`/admin`, `/internal`, versioned staging hosts).
+3. Launch with `fspawn com.example.app web` (or `intercept`) and capture the real request set.
+4. Diff static endpoints vs captured endpoints: what the app *can* call but did not is where the interesting bugs live.
+5. Only then start `replay` fuzzing.
+
+## Extending it
+
+`recon` is a shell script; every step is independent (`aapt2`, `apkanalyzer`, `apkid`, `apkleaks`, `mobsfscan`, `jadx`). Add steps by copying the pattern in `~/mobsec/bin/recon` — each writes into `raw/` and appends a section to `report.md`.
+
+Useful manual follow-ups it does not do:
+
+```bash
+# who signs it / is it debuggable
+apksigner verify --print-certs app.apk
+aapt2 dump xmltree app.apk --file AndroidManifest.xml | grep -i debuggable
+
+# backend fingerprinting from the flows
+jq -r 'select(.status>=400) | "\(.status) \(.method) \(.host)\(.path)"' /tmp/mtflows/_index.jsonl | sort | uniq -c | sort -rn | head
+```

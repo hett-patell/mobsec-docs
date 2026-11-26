@@ -1,0 +1,137 @@
+---
+title: "Attestation & keyboxes"
+---
+
+This is the part that usually makes people give up on emulator-based testing. A modern app asks the **Android keystore** to generate a key with a server-chosen challenge, and the keystore returns a certificate chain signed by Google's servers describing the device. The app ships that chain to its backend, which decides whether to let you in.
+
+On an emulator that chain says *"Droid Unregistered Device CA, Google Test LLC"* — an obvious emulator. On a real phone it says *"hardware-backed, verified boot green, your device"*. Even with a software keybox the chain is signed by an **expired** AOSP intermediate. Both get rejected.
+
+<Mermaid chart={`sequenceDiagram
+    participant App
+    participant KS as Android Keystore
+    participant TS as TrickyStore (Zygisk)
+    participant Srv as Backend
+    App->>KS: generateKey(alias, attestationChallenge)
+    KS->>TS: real chain (or AOSP fake chain)
+    TS-->>App: substituted chain from keybox.xml
+    App->>Srv: POST /login { attestation: { chain: [...] } }
+    Srv->>Srv: verify chain against Google roots + revocation list
+    Srv-->>App: 2000 (accepted) or 4202 (ATTESTATION_UNSUPPORTED)`} />
+
+## TrickyStore
+
+- Module id `tricky_store`, manager UI in `com.example.target`-style apps is not needed — it is driven by two files.
+- `target.txt` — one package per line: **only these apps** get spoofed chains.
+- `keybox.xml` — the replacement chain material (EC and/or RSA), plus the private keys that let the keystore actually sign with it.
+- Reads `tee_status`; on an emulator `teeBroken=true` is expected.
+
+```bash
+adb shell su -c 'cat /data/adb/tricky_store/target.txt'
+adb shell su -c 'grep -o "DeviceID=\"[^\"]*\"" /data/adb/tricky_store/keybox.xml'
+```
+
+<Callout type="info" title="DeviceID is cosmetic — do not read identity into it">
+The `DeviceID` attribute is just a label the upstream keybox author typed. For the public
+`RED-TEAM-KEYBOX` source it is literally a Telegram advert
+(`DeviceID="RKP keybox. Join my group: t.me/redteamchannell"`). TrickyStore never uses it and the
+server validates the **chain**, not the label — so it is normal for it to look like spam and to
+change on every `keybox-refresh`. `pentestctl status` prints it tagged *(cosmetic upstream label)*.
+</Callout>
+
+
+<Callout type="warn" title="Forgetting target.txt looks like a broken keybox">
+Before adding the package, the app still receives the emulator's own fake chain. The server says *"this device could not be verified"* and you blame the keybox. Add the package, force-stop the app, relaunch — no reboot required.
+</Callout>
+
+
+## Keybox lifecycle
+
+A usable keybox must satisfy **all** of:
+
+1. Chain signatures verify up to a known root.
+2. Nothing in the chain is **expired**.
+3. The serial numbers are **not on Google's revocation list** (`https://android.googleapis.com/attestation/status`).
+4. It is a **hardware/RKP** chain — the server can tell software chains apart, and they are rejected by anything modern.
+
+Check all four before installing:
+
+```bash
+kbcheck.py --summary /tmp/kb.xml
+# SUMMARY device=<cosmetic upstream label> alg=ecdsa len=4 root=None sig=ok leaf_not_after=2026-12-04 revoked=- expired=-
+kbcheck.py --strict /tmp/kb.xml      # exit 1 unless every check passes
+```
+
+`root=None` is normal: the bundled root bundle (`tools/keybox-res/`) predates the RKP root (`CN=Key Attestation CA1`), so the root *pin* cannot be matched — signatures and revocation still validate, and the server is the real judge.
+
+### The one that works right now
+
+```bash
+setup-keybox.sh                       # fetch from upstream, validate, install, back up the old one
+keybox-refresh                        # same thing, but only if it is actually needed
+pentestctl status | grep keybox
+#   --   keybox DeviceID="RKP keybox. Join my group: t.me/redteamchannell" (cosmetic upstream label, not an identity — the chain is what matters)
+#   ok   keybox leaf valid until 2026-12-04 (8d left)
+```
+
+Source: `redteam-git/RED-TEAM-KEYBOX` publishes a base64 blob at `…/main/conf` (refreshed every 4 h upstream). `setup-keybox.sh --file <xml>` installs a local file; `--check` validates only.
+
+### Keeping it alive: `keybox-refresh`
+
+Keyboxes die quietly — the leaf expires and the server starts answering `4202` again with no other symptom. `keybox-refresh` is the boring fix:
+
+```bash
+keybox-refresh                 # refresh only if < 7 days left, revoked, or already expired
+keybox-refresh --force         # refresh now, e.g. when the target starts refusing you
+keybox-refresh --min-days 20   # keep a wider safety margin
+keybox-refresh --dry-run       # validate the device keybox and print what it would do
+```
+
+How it behaves:
+
+1. Reads the device keybox, runs `kbcheck.py --summary` (`device=… leaf_not_after=… sig=… revoked=…`).
+2. Stays put unless the keybox is close to expiry or already dead.
+3. Tries sources in order — `redteam`, then `yuri` — accepting only payloads that `kbcheck.py --strict` accepts (signatures, chain, expiry, of the revocation list).
+4. Backs up the old keybox as `keybox.xml.bak_<ts>` and force-stops `com.example.target`, `com.android.vending`, `com.google.android.gms` so they re-open the keystore.
+5. Appends to `~/.mobsec/keybox.log`.
+
+It runs automatically through a **systemd user timer** (`mobsec-keybox.timer`: 10 min after boot, then daily with a randomised delay, `Persistent=true`):
+
+```bash
+systemctl --user list-timers | grep mobsec
+systemctl --user start mobsec-keybox.service    # run it now
+journalctl --user -u mobsec-keybox.service -n 20
+```
+
+The current leaf expires **2026-12-04**; `pentestctl status` prints the remaining days on every run, so the timer is a safety net and not the primary signal.
+
+### Anatomy of a rejected keybox (real example)
+
+The well-known Yurikey keybox had a perfect hardware chain — and its leaf serial `bb0d83fa2a47a1ae54c8c359778aaf35` was on Google's revocation list (2222 entries). Everything looked right in the UI, and the server still said no. Always check revocation, not just expiry.
+
+## What the server actually validates
+
+From the target app's behaviour, in order of strictness:
+
+1. Chain parses and every signature verifies.
+2. Leaf public key matches the challenge-signed data.
+3. Chain contains Google's RKP attestation extension (hardware root of trust).
+4. No serial is revoked, nothing expired.
+5. Sometimes: `verifiedBootState` = green, `deviceLocked` = true, `osVersion` sane.
+
+TrickyStore supplies 1–5 for keystore users, but the **revocation list** is checked server-side and cannot be spoofed locally. That is why a revoked keybox is worthless even though the UI shows a beautiful chain.
+
+## Verifying on-device
+
+Install **KeyAttestation** (`io.github.vvb2060.keyattestation`, in `apks/`) and generate a key:
+
+- ✅ expected: `CN=App Attest Key` issued by `O=TEE,CN=<32 hex>`, "Bootloader is locked", manufacturer from the keybox, ~32 certs issued in the last 30 days.
+- ⚠️ expected on this rig: banner *"Unknown root certificate — root is not a known trusted CA"*. Its local root pool does not contain the RKP root; the target server's does. Not a failure.
+- ❌ if you see `CN=Android Keystore Software Attestation Intermediate`: `target.txt` is missing the package, or `keybox.xml` is the bundled software one.
+
+## Play Integrity is a different problem
+
+Play Integrity's `MEETS_DEVICE_INTEGRITY` cannot be faked on an emulator; measured here as **UNEVALUATED** (Google declines to grade an emulator with no account) before and after PlayIntegrityFix. This rig does not solve PI, and does not need to for apps that use raw key attestation. The mechanics, the `integrity` tool and the escape routes are on the [Play Integrity](/docs/integrity) page.
+
+<Callout type="info" title="x86_64 gotcha">
+`PlayIntegrityFork` v19 ships only arm64/armv7 `zygisk` libs, so on this x86_64 image it silently never loads (`zygiskd status` stops listing `playintegrityfix`). The installed module is `PlayIntegrityFix_v4.9-inject-s.zip`, which does ship x86_64. v19 is parked in `modules/archive/`.
+</Callout>

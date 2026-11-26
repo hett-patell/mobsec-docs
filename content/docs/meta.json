@@ -1,0 +1,28 @@
+{
+  "title": "Documentation",
+  "pages": [
+    "index",
+    "---Getting started---",
+    "quickstart",
+    "workflow",
+    "status",
+    "---Method---",
+    "checklist",
+    "---How it works---",
+    "architecture",
+    "interception",
+    "frida",
+    "attestation",
+    "integrity",
+    "stealth",
+    "---Tools---",
+    "tooling",
+    "recon",
+    "flows",
+    "snapshots",
+    "---Reference---",
+    "troubleshooting",
+    "rebuild",
+    "glossary"
+  ]
+}

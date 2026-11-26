@@ -1,12 +1,7 @@
-# MkDocs build output (published to the gh-pages branch by `mkdocs gh-deploy`)
-/site/
-
-# Python / tooling
-__pycache__/
-*.pyc
-.venv/
-venv/
-
-# OS cruft
+node_modules/
+.next/
+out/
+.source/
 .DS_Store
-Thumbs.db
+*.tsbuildinfo
+next-env.d.ts
