@@ -1,0 +1,84 @@
+# Rebuild from scratch
+
+Two artefacts describe a rebuild:
+
+- **`GUIDE-from-scratch.md`** — the narrative walkthrough (12 sections, beginner-friendly, includes the interactive Magisk UI steps and every download URL).
+- **`bootstrap.sh` / `fetch-deps.sh` / `install-device.sh` / `setup-keybox.sh` / `setup-net.sh`** — the automated path, in that order.
+
+## Automated path
+
+```bash
+git clone <your copy> ~/mobsec && cd ~/mobsec
+
+./bootstrap.sh --sdk        # host deps, pipx tools, Android SDK, AVD creation, PATH block
+emulator -avd pentest16 -no-snapshot -no-boot-anim &
+./fetch-deps.sh             # frida-server (x86_64 + arm64), jadx, apktool, scrcpy, rootAVD
+# >>> root the image with rootAVD (interactive, see GUIDE §4) <<<
+./install-device.sh         # Magisk modules, frida-server staging, zygisk policy, reboot
+./setup-keybox.sh           # fetch + validate + install a keybox
+./setup-net.sh              # install mitm CA into the system store, proxy + tunnel
+pentestctl status
+```
+
+### Why the order is fixed
+
+| Step | Depends on | Fails if skipped |
+|---|---|---|
+| `bootstrap.sh` | — | no SDK/adb/emulator/AVD |
+| `fetch-deps.sh` | network | nothing to install downstream |
+| rootAVD | booted, unrooted device | `install-device.sh` aborts on missing `su` |
+| `install-device.sh` | root | no TrickyStore/PIF/Cert-Fixer/fsrv |
+| `setup-keybox.sh` | TrickyStore on device | attestation stays software/AOSP |
+| `setup-net.sh` | Cert-Fixer installed + one boot | user apps work, GMS/Play Store do not |
+
+`install-device.sh` finishes with a reboot; wait for `adb wait-for-device` before continuing.
+
+### What is interactive
+
+Only Magisk's first-run flow: *Install → Patch firmware/image → Select from storage → fakeboot.img → OK → additional setup → reboot*, plus granting `su` to shell. `GUIDE §4` has the exact taps; `uitap` can drive them by text, but expect to babysit it once.
+
+## Sharing the rig with a colleague
+
+```bash
+zip -qr ~/share-zip/mobsec-rig-$(date +%Y%m%d).zip ~/mobsec \
+  -x '*/tools/jadx*' '*/tools/scrcpy*' '*/tools/apktool*' '*/tools/frida-server-*' \
+     '*/modules/MagiskFrida*' '*/modules/archive/*' '*/apks/*' '*/tools/medusa/.venv/*' \
+     '*/site/*' '*/.mobsec/*' '*/__pycache__/*'
+```
+
+Deliberately excluded, with reasons:
+
+| Excluded | Why |
+|---|---|
+| `keybox.xml`, `.pem`, `.p12` | key material; the recipient must fetch their own |
+| `~/.mobsec/session`, `~/.mitmproxy` | live cookies/tokens and your private CA |
+| AVD snapshots | 5 GB each, host-specific |
+| tool binaries (jadx, scrcpy, frida-server) | re-downloadable via `fetch-deps.sh`, keeps the zip ~25 MB |
+| `MagiskFrida-*.zip` | 141 MB, superseded by the `fsrv` module |
+
+The recipient still needs **their own** `adb` device and must run `setup-net.sh` so their mitmproxy CA (not ours) is installed. `SHARING.md` in the archive carries the exact run order and this table.
+
+## Verification after a rebuild
+
+```bash
+pentestctl status                                  # every section green
+frida-ps -U | head -3                              # 150+ processes
+curl -s -x 127.0.0.1:18080 -o /dev/null -w '%{http_code}\n' https://example.org   # 200
+fspawn tech.httptoolkit.pinning_demo intercept     # "OkHTTP pinned request - Success"
+recon com.android.settings --deep                  # recon sanity check
+snap save logged-in                                # your first restore point
+```
+
+## Version pinning that matters
+
+| Component | Version | Why pinned |
+|---|---|---|
+| Magisk | 31.1 | Zygisk Next expects it; older Magisk has no `--sqlite` settings write |
+| Zygisk Next | 1.5.3-880 | later builds changed `zygiskd` flags |
+| frida-server | 17.27.5 | must match host `frida` exactly; 17.x removed `global`, changed `Module` API |
+| Frida host | 17.27.5 | mismatch = "unable to communicate with remote frida-server" |
+| PlayIntegrityFix | 4.9-inject-s | v19 has no x86_64 zygisk lib |
+| jadx | 1.5.7 | apkleaks shells out to it |
+| mitmproxy | 12.3.1 | addon uses `http.HTTPFlow` API (stable since 9) |
+
+When you bump a version, re-run the [verification list](#verification-after-a-rebuild) top to bottom before trusting the rig.

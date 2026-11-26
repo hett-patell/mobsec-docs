@@ -1,0 +1,112 @@
+site_name: mobsec — Android pentest rig
+site_description: A rooted, Frida-wired Android 16 emulator with working HTTPS interception and attestation spoofing.
+site_author: mobsec
+site_url: https://mobsec.networkshard.com/
+repo_url: https://github.com/hett-patell/mobsec-docs
+repo_name: hett-patell/mobsec-docs
+docs_dir: docs
+site_dir: site
+use_directory_urls: true
+
+theme:
+  name: material
+  language: en
+  palette:
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: amber
+      toggle:
+        icon: material/weather-sunny
+        name: Light
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: amber
+      toggle:
+        icon: material/weather-night
+        name: Dark
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - navigation.tracking
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+  icon:
+    repo: fontawesome/brands/git-alt
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.keys
+
+plugins:
+  - search
+  - tags
+
+extra:
+  generator: false
+  social:
+    - icon: material/laptop
+      link: http://127.0.0.1:8000
+      name: Running locally
+
+nav:
+  - Start here: index.md
+  - Getting started:
+      - Quickstart: quickstart.md
+      - Daily workflow: workflow.md
+      - Live status: status.md
+  - Method:
+      - Pentest checklist: checklist.md
+  - How it works:
+      - Architecture: architecture.md
+      - HTTPS interception: interception.md
+      - Frida & instrumentation: frida.md
+      - Attestation & keyboxes: attestation.md
+      - Play Integrity: integrity.md
+      - Root hiding: stealth.md
+  - Tools:
+      - Command reference: tooling.md
+      - Static recon: recon.md
+      - Captured flows & replay: flows.md
+      - Snapshots: snapshots.md
+  - Reference:
+      - Troubleshooting: troubleshooting.md
+      - Rebuild from scratch: rebuild.md
+      - Glossary: glossary.md
+
+extra_css:
+  - stylesheets/extra.css
+
+copyright: Built for authorised testing only. Keybox + attestation spoofing make this device claim identities it does not own.

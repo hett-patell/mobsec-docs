@@ -1,0 +1,44 @@
+/* small quality-of-life tweaks on top of Material */
+:root {
+  --md-code-font: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
+}
+.md-typeset table:not([class]) {
+  font-size: .72rem;
+}
+.md-typeset table:not([class]) td:first-child code {
+  white-space: nowrap;
+}
+.md-typeset pre > code {
+  font-size: .74rem;
+  line-height: 1.45;
+}
+.md-typeset .admonition.warning {
+  border-left-width: 4px;
+}
+/* keep wide mermaid diagrams from hugging the page edge */
+.md-typeset .mermaid {
+  margin: 1.2rem 0;
+  text-align: center;
+}
+/* status pills used on the status page */
+.pill {
+  display: inline-block;
+  padding: .05rem .45rem;
+  border-radius: .5rem;
+  font-size: .68rem;
+  font-weight: 600;
+  letter-spacing: .02em;
+}
+.pill-ok { background: #1b5e20; color: #e8f5e9; }
+.pill-warn { background: #7c4d00; color: #fff8e1; }
+.pill-bad { background: #7f1d1d; color: #fee2e2; }
+
+/* search field: readable on the coloured header in both schemes */
+.md-search__form {
+  background-color: rgba(255, 255, 255, .16) !important;
+  border-radius: .25rem;
+}
+.md-search__input::placeholder { color: rgba(255, 255, 255, .72); }
+[data-md-color-scheme="slate"] .md-search__form {
+  background-color: rgba(255, 255, 255, .08) !important;
+}
