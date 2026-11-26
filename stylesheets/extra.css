@@ -1,44 +1,473 @@
-/* small quality-of-life tweaks on top of Material */
+/* ==========================================================================
+   GitBook-style theme layer for MkDocs Material
+   ========================================================================== */
+
 :root {
-  --md-code-font: "JetBrains Mono", "Fira Code", ui-monospace, monospace;
+  --md-text-font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --md-code-font: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --gb-radius-sm: 6px;
+  --gb-radius-md: 8px;
+  --gb-radius-lg: 10px;
 }
+
+/* Light mode tokens (GitBook clean light) */
+[data-md-color-scheme="default"] {
+  color-scheme: light;
+  --gb-bg: #ffffff;
+  --gb-bg-sidebar: #f8fafc;
+  --gb-bg-elevated: #f1f5f9;
+  --gb-bg-code: #f8fafc;
+  --gb-border: #e2e8f0;
+  --gb-border-strong: #cbd5e1;
+  --gb-text: #0f172a;
+  --gb-text-secondary: #475569;
+  --gb-text-muted: #64748b;
+  --gb-accent: #346ddb;
+  --gb-accent-hover: #2557bd;
+  --gb-accent-soft: rgba(52, 109, 219, 0.10);
+  --gb-accent-border: rgba(52, 109, 219, 0.28);
+
+  --md-default-bg-color: var(--gb-bg);
+  --md-default-fg-color: var(--gb-text);
+  --md-default-fg-color--light: var(--gb-text-secondary);
+  --md-default-fg-color--lighter: var(--gb-text-muted);
+  --md-primary-fg-color: var(--gb-bg);
+  --md-primary-bg-color: var(--gb-text);
+  --md-accent-fg-color: var(--gb-accent);
+  --md-typeset-a-color: var(--gb-accent);
+  --md-code-bg-color: var(--gb-bg-code);
+  --md-code-fg-color: #1e293b;
+
+  scrollbar-color: #cbd5e1 transparent;
+}
+
+/* Dark mode tokens (GitBook deep slate) */
+[data-md-color-scheme="slate"] {
+  color-scheme: dark;
+  --gb-bg: #0f1117;
+  --gb-bg-sidebar: #13161f;
+  --gb-bg-elevated: #1a1e2b;
+  --gb-bg-code: #141822;
+  --gb-border: #232838;
+  --gb-border-strong: #32394f;
+  --gb-text: #f1f5f9;
+  --gb-text-secondary: #94a3b8;
+  --gb-text-muted: #64748b;
+  --gb-accent: #6396ff;
+  --gb-accent-hover: #82abff;
+  --gb-accent-soft: rgba(99, 150, 255, 0.13);
+  --gb-accent-border: rgba(99, 150, 255, 0.32);
+
+  --md-default-bg-color: var(--gb-bg);
+  --md-default-fg-color: var(--gb-text);
+  --md-default-fg-color--light: var(--gb-text-secondary);
+  --md-default-fg-color--lighter: var(--gb-text-muted);
+  --md-primary-fg-color: var(--gb-bg);
+  --md-primary-bg-color: var(--gb-text);
+  --md-accent-fg-color: var(--gb-accent);
+  --md-typeset-a-color: var(--gb-accent);
+  --md-code-bg-color: var(--gb-bg-code);
+  --md-code-fg-color: #e2e8f0;
+
+  scrollbar-color: #32394f transparent;
+}
+
+/* --------------------------------------------------------------------------
+   Top Header — flat, surface-matched, 1px bottom border (GitBook topbar)
+   -------------------------------------------------------------------------- */
+.md-header {
+  background-color: var(--gb-bg) !important;
+  color: var(--gb-text) !important;
+  box-shadow: none !important;
+  border-bottom: 1px solid var(--gb-border);
+  backdrop-filter: saturate(180%) blur(10px);
+}
+
+.md-header__title,
+.md-header__button,
+.md-source {
+  color: var(--gb-text) !important;
+}
+
+.md-header__topic:first-child {
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  font-size: 0.92rem;
+}
+
+.md-header__button.md-logo {
+  margin-right: 0.25rem;
+  padding: 0.35rem;
+  color: var(--gb-accent) !important;
+}
+
+/* Search input — GitBook pill input with border */
+.md-search__form {
+  background-color: var(--gb-bg-sidebar) !important;
+  border: 1px solid var(--gb-border);
+  border-radius: var(--gb-radius-md) !important;
+  height: 2rem;
+  transition: border-color 150ms ease, background-color 150ms ease;
+}
+
+.md-search__form:hover {
+  border-color: var(--gb-border-strong);
+}
+
+.md-search__input {
+  color: var(--gb-text) !important;
+  font-size: 0.78rem;
+}
+
+.md-search__input::placeholder,
+.md-search__icon {
+  color: var(--gb-text-muted) !important;
+}
+
+/* --------------------------------------------------------------------------
+   Layout Grid & Left Navigation Sidebar — GitBook tree sidebar
+   -------------------------------------------------------------------------- */
+.md-grid {
+  max-width: 1440px;
+}
+
+@media screen and (min-width: 76.25em) {
+  .md-sidebar--primary {
+    background-color: var(--gb-bg-sidebar);
+    border-right: 1px solid var(--gb-border);
+    width: 15.5rem;
+    padding-top: 1rem;
+  }
+
+  .md-sidebar--primary .md-sidebar__scrollwrap {
+    margin: 0;
+    padding: 0 0.65rem 2rem;
+  }
+}
+
+/* Hide redundant sidebar title at top of left tree */
+.md-nav--primary > .md-nav__title {
+  display: none;
+}
+
+/* Section group headings in left sidebar (e.g. GETTING STARTED, HOW IT WORKS) */
+.md-nav--primary .md-nav__item--section > .md-nav__link,
+.md-nav--primary .md-nav__item--section > .md-nav__container > .md-nav__link {
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--gb-text-muted) !important;
+  padding: 0.45rem 0.6rem 0.25rem;
+  margin-top: 0.75rem;
+  pointer-events: none;
+}
+
+.md-nav--primary > .md-nav__list > .md-nav__item--section:first-child > .md-nav__link {
+  margin-top: 0.15rem;
+}
+
+.md-nav__item--section {
+  margin: 0.35rem 0 0.65rem !important;
+}
+
+/* Individual sidebar links — GitBook rounded pill items */
+.md-nav--primary .md-nav__link {
+  font-size: 0.8125rem;
+  font-weight: 450;
+  line-height: 1.35;
+  color: var(--gb-text-secondary);
+  padding: 0.42rem 0.65rem;
+  margin: 1px 0;
+  border-radius: var(--gb-radius-sm);
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+.md-nav--primary .md-nav__link:hover,
+.md-nav--primary .md-nav__link:focus {
+  background-color: var(--gb-bg-elevated);
+  color: var(--gb-text);
+}
+
+/* Active page in left sidebar */
+.md-nav--primary .md-nav__link--active,
+.md-nav--primary .md-nav__item--active > .md-nav__link {
+  background-color: var(--gb-accent-soft) !important;
+  color: var(--gb-accent) !important;
+  font-weight: 600;
+}
+
+/* --------------------------------------------------------------------------
+   Right Table of Contents ("On this page") — GitBook left-rail indicator
+   -------------------------------------------------------------------------- */
+.md-nav--secondary .md-nav__title {
+  background: transparent !important;
+  box-shadow: none !important;
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--gb-text-muted);
+  padding: 0 0 0.5rem 0.75rem;
+}
+
+.md-nav--secondary > .md-nav__list {
+  border-left: 1px solid var(--gb-border);
+  padding-left: 0;
+}
+
+.md-nav--secondary .md-nav__link {
+  font-size: 0.76rem;
+  color: var(--gb-text-muted);
+  padding: 0.26rem 0.5rem 0.26rem 0.85rem;
+  margin-left: -1px;
+  border-left: 2px solid transparent;
+  border-radius: 0;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+
+.md-nav--secondary .md-nav__link:hover {
+  color: var(--gb-text);
+}
+
+.md-nav--secondary .md-nav__link--active {
+  color: var(--gb-accent) !important;
+  border-left-color: var(--gb-accent);
+  font-weight: 550;
+}
+
+/* --------------------------------------------------------------------------
+   Main Content Area & Typography — GitBook proportions
+   -------------------------------------------------------------------------- */
+.md-content {
+  max-width: 50rem;
+  margin: 0 auto;
+}
+
+.md-content__inner {
+  padding-top: 1.4rem;
+  padding-bottom: 3rem;
+}
+
+.md-typeset {
+  font-size: 0.84rem;
+  line-height: 1.7;
+  color: var(--gb-text);
+}
+
+/* Breadcrumb path above H1 */
+.md-path {
+  font-size: 0.75rem;
+  margin-bottom: 0.25rem;
+}
+
+.md-typeset h1 {
+  font-size: 2rem;
+  font-weight: 750;
+  letter-spacing: -0.028em;
+  line-height: 1.2;
+  color: var(--gb-text);
+  margin: 0 0 1.1rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--gb-border);
+}
+
+.md-typeset h2 {
+  font-size: 1.32rem;
+  font-weight: 680;
+  letter-spacing: -0.02em;
+  line-height: 1.3;
+  color: var(--gb-text);
+  margin: 2.1rem 0 0.8rem;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid var(--gb-border);
+}
+
+.md-typeset h3 {
+  font-size: 1.05rem;
+  font-weight: 640;
+  letter-spacing: -0.012em;
+  color: var(--gb-text);
+  margin: 1.5rem 0 0.55rem;
+}
+
+.md-typeset a {
+  text-decoration: underline;
+  text-decoration-color: var(--gb-accent-border);
+  text-underline-offset: 3px;
+  font-weight: 500;
+}
+
+.md-typeset a:hover {
+  color: var(--gb-accent-hover);
+  text-decoration-color: var(--gb-accent);
+}
+
+/* Subtle anchor permalink '#' */
+.md-typeset .headerlink {
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.md-typeset :is(h1, h2, h3, h4):hover .headerlink {
+  opacity: 0.65;
+}
+
+/* --------------------------------------------------------------------------
+   Code Blocks & Inline Code — GitBook bordered cards
+   -------------------------------------------------------------------------- */
+.md-typeset code:not(pre code) {
+  background-color: var(--gb-bg-elevated);
+  border: 1px solid var(--gb-border);
+  border-radius: 5px;
+  padding: 0.12em 0.42em;
+  font-size: 0.84em;
+  font-weight: 500;
+}
+
+.md-typeset pre {
+  border: 1px solid var(--gb-border);
+  border-radius: var(--gb-radius-md);
+  background-color: var(--gb-bg-code);
+  overflow: hidden;
+}
+
+.md-typeset pre > code {
+  font-size: 0.76rem;
+  line-height: 1.55;
+  padding: 0.9rem 1.05rem;
+}
+
+/* --------------------------------------------------------------------------
+   Admonitions / Callouts — flat GitBook callout boxes
+   -------------------------------------------------------------------------- */
+.md-typeset .admonition,
+.md-typeset details {
+  background-color: var(--gb-bg-sidebar) !important;
+  border: 1px solid var(--gb-border) !important;
+  border-left-width: 3px !important;
+  border-radius: var(--gb-radius-md) !important;
+  box-shadow: none !important;
+  padding: 0.65rem 0.95rem;
+  font-size: 0.81rem;
+}
+
+.md-typeset .admonition-title,
+.md-typeset summary {
+  background-color: transparent !important;
+  border-bottom: none !important;
+  font-weight: 650;
+  padding: 0.15rem 0 0.25rem 1.8rem !important;
+}
+
+.md-typeset .admonition-title::before,
+.md-typeset summary::before {
+  left: 0 !important;
+  top: 0.2rem !important;
+}
+
+/* --------------------------------------------------------------------------
+   Tables — GitBook clean bordered table cards
+   -------------------------------------------------------------------------- */
 .md-typeset table:not([class]) {
-  font-size: .72rem;
+  font-size: 0.78rem;
+  border: 1px solid var(--gb-border);
+  border-radius: var(--gb-radius-md);
+  box-shadow: none;
+  overflow: hidden;
 }
+
+.md-typeset table:not([class]) th {
+  background-color: var(--gb-bg-sidebar);
+  color: var(--gb-text-secondary);
+  font-weight: 650;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--gb-border);
+  padding: 0.65rem 0.85rem;
+}
+
+.md-typeset table:not([class]) td {
+  border-top: 1px solid var(--gb-border);
+  padding: 0.6rem 0.85rem;
+}
+
 .md-typeset table:not([class]) td:first-child code {
   white-space: nowrap;
 }
-.md-typeset pre > code {
-  font-size: .74rem;
-  line-height: 1.45;
-}
-.md-typeset .admonition.warning {
-  border-left-width: 4px;
-}
-/* keep wide mermaid diagrams from hugging the page edge */
+
+/* Keep wide mermaid diagrams breathing nicely */
 .md-typeset .mermaid {
-  margin: 1.2rem 0;
+  margin: 1.4rem 0;
+  padding: 1rem;
+  background-color: var(--gb-bg-sidebar);
+  border: 1px solid var(--gb-border);
+  border-radius: var(--gb-radius-md);
   text-align: center;
 }
-/* status pills used on the status page */
+
+/* --------------------------------------------------------------------------
+   Footer Prev / Next Page Cards — GitBook signature bottom nav cards
+   -------------------------------------------------------------------------- */
+.md-footer {
+  background-color: var(--gb-bg);
+  color: var(--gb-text-secondary);
+  border-top: 1px solid var(--gb-border);
+}
+
+.md-footer__inner {
+  max-width: 50rem;
+  margin: 0 auto;
+  padding: 1.25rem 0.8rem;
+  gap: 0.85rem;
+}
+
+.md-footer__link {
+  flex: 1;
+  border: 1px solid var(--gb-border);
+  border-radius: var(--gb-radius-md);
+  padding: 0.85rem 1.05rem;
+  margin: 0 !important;
+  background-color: var(--gb-bg-sidebar);
+  color: var(--gb-text) !important;
+  transition: border-color 150ms ease, background-color 150ms ease;
+}
+
+.md-footer__link:hover {
+  border-color: var(--gb-accent);
+  background-color: var(--gb-accent-soft);
+  opacity: 1 !important;
+}
+
+.md-footer__direction {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--gb-text-muted);
+}
+
+.md-footer__title {
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.md-footer-meta {
+  background-color: var(--gb-bg-sidebar);
+  border-top: 1px solid var(--gb-border);
+}
+
+/* --------------------------------------------------------------------------
+   Status pills (used on Live status page — preserved)
+   -------------------------------------------------------------------------- */
 .pill {
   display: inline-block;
-  padding: .05rem .45rem;
-  border-radius: .5rem;
-  font-size: .68rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 9999px;
+  font-size: 0.68rem;
   font-weight: 600;
-  letter-spacing: .02em;
+  letter-spacing: 0.02em;
 }
-.pill-ok { background: #1b5e20; color: #e8f5e9; }
-.pill-warn { background: #7c4d00; color: #fff8e1; }
+.pill-ok { background: #14532d; color: #dcfce7; }
+.pill-warn { background: #78350f; color: #fef3c7; }
 .pill-bad { background: #7f1d1d; color: #fee2e2; }
-
-/* search field: readable on the coloured header in both schemes */
-.md-search__form {
-  background-color: rgba(255, 255, 255, .16) !important;
-  border-radius: .25rem;
-}
-.md-search__input::placeholder { color: rgba(255, 255, 255, .72); }
-[data-md-color-scheme="slate"] .md-search__form {
-  background-color: rgba(255, 255, 255, .08) !important;
-}
