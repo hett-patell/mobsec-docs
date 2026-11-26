@@ -1,0 +1,67 @@
+# Architecture (/docs/architecture)
+
+Five layers, each one only there because without it a specific thing fails. The diagram is the fast way to understand the rig; the table below is the "why".
+
+<Mermaid chart="flowchart TB\n  subgraph host[\"Host (Linux Mint)\"]\n      M[mitmdump :18080<br/>mitm/dump.py]\n      T[adb reverse tcp:18080]\n      F[frida CLI 17.27.5]\n      CDP[cdp / session<br/>CDP :9222]\n      R[replay / recon / snap]\n  end\n\n  subgraph emu[\"pentest16 — Android 16 x86_64\"]\n      subgraph zyg[\"Zygote (Zygisk Next)\"]\n          TS[TrickyStore<br/>attestation spoof]\n          PIF[PlayIntegrityFix 4.9]\n          HMA[HMA-OSS<br/>app list filter]\n      end\n      MAG[Magisk 31.1 + su]\n      CF[Cert-Fixer<br/>CA bind-mount]\n      FS[frida-server as 'hluda'<br/>127.0.0.1:27042]\n      APP[Target app<br/>+ WebView]\n  end\n\n  F -->|frida protocol| FS\n  FS --> APP\n  M --- T --- APP\n  M -.->|flows| R\n  CF -.->|trust| APP\n  TS -.->|keystore| APP\n  MAG --> FS\n  MAG --> zyg\n  CDP -->|websocket| APP\n  R -->|replay| M" />
+
+## The layers, in dependency order [#the-layers-in-dependency-order]
+
+### 1. Emulator [#1-emulator]
+
+`pentest16` is a **Play Store** (`google_apis_playstore`) system image for API 36, x86_64, pixel_7 profile, 6 GB RAM, 16 GB data partition. Play Store matters: several attestation-ish code paths check for GMS presence and behave differently without it.
+
+It runs with KVM acceleration (`/dev/kvm`, user in `kvm` group), 4 vCPUs, and GPU on. Boot from cold is ~90 s; from a snapshot, ~25 s.
+
+### 2. Root — rootAVD + Magisk [#2-root--rootavd--magisk]
+
+`rootAVD` patches `ramdisk.img` of the **system image** (not the AVD) with Magisk, then the Magisk app does a second "additional setup" pass on first boot. Result: `su` works, `context=u:r:magisk:s0`.
+
+Magisk 31.1 specifics that bite:
+
+- Built-in Zygisk must be **off** (`magisk --sqlite "replace into settings (key,value) values('zygisk',0)"`) because **Zygisk Next** owns injection.
+- Magisk's denylist is **empty** by design here. Adding an app would strip our modules (TrickyStore, PIF) from exactly the app that needs them.
+- `magisk --denylist rm <pkg> <process>` (two args) **segfaults the daemon**. Use one argument.
+
+### 3. Zygisk modules [#3-zygisk-modules]
+
+| Module | id | Job |
+|---|---|---|
+| Zygisk Next 1.5.3 | `zygisksu` | The injector. `zygiskd` CLI controls policy, memory type, module list. |
+| TrickyStore 1.4.1 | `tricky_store` | Replaces the keystore's attestation certificate chain for packages in `target.txt` using `keybox.xml`. |
+| PlayIntegrityFix 4.9 | `playintegrityfix` | Tries to satisfy Play Integrity. On an emulator: **NO_INTEGRITY**, permanently. |
+| HMA-OSS (Vector-flavoured) | `hma_oss_zygisk` | Hides other installed packages from a target app (root/emulator detector enumeration). |
+| Cert-Fixer 1.1 | `cert-fixer` | Bind-mounts user CAs into `/apex/com.android.conscrypt/cacerts` at `post-fs-data`, so **GMS and Play Store** trust mitmproxy too. |
+| fsrv (ours) | `fsrv` | Renames and autostarts `frida-server` as `/data/adb/fsrv/hluda`, loopback only. |
+
+Zygisk Next's memory type is set to **anonymous** so module libs never appear in `/proc/<pid>/maps` as files.
+
+### 4. Interception [#4-interception]
+
+<Mermaid chart="sequenceDiagram\n  participant App\n  participant Proxy as mitmdump :18080\n  participant Up as upstream\n  App->>Proxy: HTTP/2 CONNECT (adb reverse tunnel)\n  Proxy->>Up: TLS to real server\n  Note over Proxy: dump.py writes /tmp/mtflows/<HHMMSS>_<host>_<path>.txt\n  Proxy-->>App: TLS with mitmproxy CA\n  Note over App: CA trusted because Cert-Fixer mounted it into conscrypt" />
+
+Two details make this painless:
+
+- **`adb reverse`** (device → host), not a proxy on the LAN, so no `http_proxy` is needed for pinned apps. `adb reverse` dies on every reboot; `nettap on` restores it.
+- **Cert-Fixer** mounts the CA at boot for the *whole system*, which is why Play Store and GMS traffic decrypts instead of failing with `does not trust the proxy's certificate`.
+
+### 5. Host tooling [#5-host-tooling]
+
+`pentestctl` (health), `nettap` (proxy+tunnel+addon), `fspawn` (spawn under Frida with a profile), `fdp`/`cdp` (WebView DevTools), `session` (harvest cookies+storage), `replay` (re-issue requests), `recon` (static APK), `snap` (AVD snapshots), `uitap` (UI automation), `asu` (run root snippets).
+
+## What fails if you remove a layer [#what-fails-if-you-remove-a-layer]
+
+| Remove | Symptom |
+|---|---|
+| Cert-Fixer | Chrome/WebView still decrypts (user CA), but **Play Store and GMS** throw TLS handshake errors. |
+| TrickyStore `target.txt` entry | App gets the emulator's fake AOSP chain → server rejects with an attestation error. |
+| Valid keybox | Chain becomes the bundled **software** AOSP keybox (expired intermediate) → server rejects. |
+| `zygiskd enforce-denylist` off | Nothing breaks; denylist simply stops being honoured. |
+| `adb reverse` | App talks to a dead proxy: spinner forever, zero flows. This is the #1 "it broke overnight" cause. |
+| Zygisk Next | No TrickyStore, no PIF, no HMA — attestation spoof and hiding both vanish. |
+
+## Design decisions worth knowing [#design-decisions-worth-knowing]
+
+- **Play Store image over AOSP** — closer to a real device for attestation checks; the cost is a heavier boot and GMS noise in every capture (filtered by `IGNORE` in `dump.py`).
+- **Denylist policy `default`, not `whitelist`** — whitelist mode injects only for listed packages, but WebView renderer sandbox processes (`…:sandboxed_process0`, isolated uid) never match the package name, so every page load failed with `net_error -202`. Tried it, reverted it; see [Root hiding](/docs/stealth#whitelist-trap).
+- **frida-server, not gadget** — gadget needs per-APK patching and re-signing, which changes the APK signature (and some servers check it). Server-side injection leaves the APK untouched.
+- **Loopback-only frida** — `LISTEN=127.0.0.1:27042` + `adb` forwarding. Nothing on the LAN can reach the agent, and no `frida-server` string appears in a listening-socket scan.

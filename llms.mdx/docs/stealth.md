@@ -1,0 +1,161 @@
+# Root hiding (/docs/stealth)
+
+Root is required for everything else here, so hiding it is a permanent tax. This rig hides the *mechanisms* (su binary, Magisk daemon, Zygisk libs, Frida) rather than trying to make a detector believe the device is unmodified — the attestation layer handles the "is this a real phone" question separately.
+
+## What is hidden, and how [#what-is-hidden-and-how]
+
+| Mechanism | Visibility | Mitigation in this rig |
+|---|---|---|
+| `su` binary / `magisk` | filesystem paths | Magisk's own mount/masking; app denylist empty so modules keep working |
+| Zygisk injection | `/proc/<pid>/maps`, dlopen paths | Zygisk Next `memory-type anonymous` → no file-backed libs |
+| Module mounts | `/proc/<pid>/mountinfo` | only whitelisted apps see them (default policy) |
+| Frida | process name, listening port, string `frida-server` | renamed `hluda`, loopback only, no default port on LAN |
+| Package enumeration | `getPackageInfo` / `queryIntentActivities` | HMA-OSS, scoped per target with `hma` |
+| Attestation | keystore chain | TrickyStore + keybox (see [Attestation](/docs/attestation)) |
+
+## Zygisk Next knobs [#zygisk-next-knobs]
+
+`/data/adb/modules/zygisksu/bin/zygiskd` is the control surface:
+
+```bash
+zygiskd status
+zygiskd enforce-denylist enabled      # honour Magisk's denylist
+zygiskd denylist-policy default       # default | whitelist
+zygiskd memory-type anonymous         # default | anonymous
+zygiskd disable-zygisk false
+```
+
+Current config (survives reboot):
+
+```text
+inject_state:1  denylist_policy:0 (default)  enforce_denylist:1  memory_type:1 (anonymous)
+modules64: 3,zygisk_vector,hma_oss_zygisk,playintegrityfix
+```
+
+### The whitelist trap [#the-whitelist-trap]
+
+`denylist-policy whitelist` means *only* listed packages get module injection — attractive for stealth, and it **breaks WebView apps**:
+
+```text
+WebView renderer (…:sandboxed_process0, isolated uid u0ai9000) does not match the package name
+→ no modules injected → no CA / no unpinning in the sandboxed renderer
+→ net_error -202 (SSL handshake failed) on every page
+```
+
+Verified and reverted. Keep `default`, and keep the app you are testing **out** of Magisk's denylist.
+
+## Magisk denylist: keep it empty [#magisk-denylist-keep-it-empty]
+
+```bash
+adb shell su -c 'magisk --denylist ls'      # expected: empty
+```
+
+If an app is in the denylist, Magisk strips module mounts from it — which is exactly where TrickyStore and PIF need to be. Hiding by denylisting is incompatible with spoofing. Choose one per app.
+
+## Traps [#traps]
+
+<Callout type="error" title="`magisk --denylist rm <pkg> <process>` segfaults the daemon">
+Two-argument form kills `magiskd`; afterwards `magisk -v` says
+`Cannot connect to daemon: Connection refused (os error 111)` and `su` is gone with it. Only a reboot recovers. Always pass a single package argument.
+</Callout>
+
+<Callout type="info" title="Magisk 31.1 removed 'Hide the Magisk app'">
+There is no stub-repackaging option in Settings and no CLI equivalent. Package-level hiding is HMA-OSS's job; keep that expectation straight when a detector lists installed packages.
+</Callout>
+
+## HMA-OSS: hiding packages from one app at a time [#hma-oss-hiding-packages-from-one-app-at-a-time]
+
+HMA-OSS (`hma_oss_zygisk`, manager `org.frknkrc44.hma_oss`) hooks package queries inside a chosen app and filters the answer. It is **scoped per target**: you say "when *this* app asks, act as if these packages do not exist".
+
+### The file that matters [#the-file-that-matters]
+
+```text
+/data/misc/hide_my_applist_bkpzksjqktswmspy/config.json
+```
+
+One JSON document, schema `configVersion: 95`, with a `scope` object keyed by target package. Each entry is an `AppConfig`:
+
+```json
+"com.example.target": {
+  "useWhitelist": false,
+  "excludeSystemApps": true,
+  "applyPresets": ["detector_apps","root_apps","shizuku_dhizuku","sus_apps","xposed"],
+  "applySettingsPresets": ["accessibility","dev_options"],
+  "extraSettings": {"settingsList": []},
+  "extraAppList": [], "extraOppositeAppList": []
+}
+```
+
+Preset names (they are the module's, not yours): apps = `accessibility_apps, custom_rom, detector_apps, root_apps, shizuku_dhizuku, sus_apps, xposed`; settings = `accessibility, dev_options, input_method`. The five app presets above are what you want against a root-detector: Magisk, KeyAttestation, Frida tooling, other test apps, Xposed-era leftovers.
+
+### Doing it from the host, not the UI [#doing-it-from-the-host-not-the-ui]
+
+```bash
+hma show                          # current scope entries
+hma hide com.example.target       # 5 app presets + 2 settings presets (defaults)
+hma hide com.example.target --presets root_apps,sus_apps --settings dev_options
+hma targets                       # what the scope currently names
+hma unhide com.example.target     # needs a reboot, see the trap below
+hma backup / hma restore          # snapshot the config before experiments
+```
+
+`hma` writes the config in place over `su`, so HMA's `FileObserver(configFile, CLOSE_WRITE or ATTRIB)` picks it up. Logcat then shows `(HMA-Service) Config loaded` (three times per write — `chmod` fires `ATTRIB` as well).
+
+<Callout type="error" title="Un-hiding does not take effect until you reboot">
+`HMAServiceDataHolder.shouldHideFromUid()` answers from a `uidHideCache` *before* it looks at the config, and only the manager-app pipe clears that cache — the file-reload path does not. Measured: `hma hide` on a live app works immediately (257 → 252 packages, Magisk hidden), `hma unhide` changes the file and nothing else. Reboot to un-hide.
+</Callout>
+
+<Callout type="warn" title="The manager app only saves on `onPause`">
+If you configure HMA in its UI and press Back, nothing is written — `AppSettingsV2Fragment` persists in `onPause`. Press HOME (or leave the app) to commit. This is why hand-editing `config.json` with `hma` is the less surprising path.
+</Callout>
+
+<Callout type="warn" title="A config.json created *after* boot is never watched">
+The `FileObserver` is constructed at boot even when the file is missing. If HMA has never written a config on this boot, your first `hma hide` needs one reboot before it has any effect. Check with `hma show` — if it is empty and you just created a scope, reboot, then re-apply.
+</Callout>
+
+## Verifying hiding actually works [#verifying-hiding-actually-works]
+
+**Measure with an app that declares `QUERY_ALL_PACKAGES`.** Without it, Android 11+ package-visibility filtering makes every app look clean:
+
+```text
+pm list packages                     → 255 packages
+Target getInstalledPackages(0)       → 91     (no QUERY_ALL_PACKAGES)
+pinning-demo getInstalledPackages(0) → 90     (no QUERY_ALL_PACKAGES)
+ApplistDetector (QUERY_ALL_PACKAGES) → 252/256 and Magisk visible or not
+```
+
+Use `apks/ApplistDetector.V2.4.apk` (`icu.nullptr.applistdetector`, Dr-TSNG) as the detector:
+
+```bash
+asu 'am start -n icu.nullptr.applistdetector/.MainActivity'
+# then read its "Installed apps" count and the Magisk/KeyAttestation rows
+```
+
+Measured on this rig, detector scoped, before vs after reboot:
+
+| state | installed count | `com.topjohnwu.magisk` |
+|---|---|---|
+| baseline, no scope | 256 | visible |
+| scoped + reboot | 252 | hidden |
+| live-added scope (Chrome) | 257 → 252 | visible → hidden, no reboot needed |
+
+HMA never hides a target app from itself, so the detector still lists `icu.nullptr.applistdetector` — that is correct behaviour, not a leak.
+
+Hiding does not disturb spoofing: after HMA was enabled, KeyAttestation still reported the keybox chain (`CN=Droid CA2, O=Google LLC`) and `Bootloader is locked`.
+
+```bash
+# module mounts visible to a normal app vs a module-injected app
+adb shell su -c 'wc -l < /proc/<settings-pid>/mountinfo'     # ~157
+adb shell su -c 'wc -l < /proc/<target-pid>/mountinfo'       # ~167 (10 module mounts)
+
+# no zygisk/tricky libs mapped
+adb shell su -c 'grep -cE "zygisk|tricky" /proc/<target-pid>/maps'   # 0
+```
+
+The 10-mount difference is the honest answer to "is injection scoped": non-target apps see zero module mounts.
+
+## What this does not hide [#what-this-does-not-hide]
+
+- **Emulator fingerprints** (`ro.kernel.qemu`, `goldfish` hardware, sensor set). Apps that check them are dealt with by `intercept`'s root/emulator detection bypass, not by this layer.
+- **A keybox that is revoked** — that is server-side truth, see [Attestation](/docs/attestation).
+- **Your traffic** — it leaves from the host's IP through mitmproxy.

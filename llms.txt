@@ -1,0 +1,30 @@
+# Documentation
+
+- [mobsec — an Android pentest rig that actually works](/llms.mdx/docs.md)
+
+- **Getting started**
+- [Quickstart](/llms.mdx/docs/quickstart.md)
+- [Daily workflow](/llms.mdx/docs/workflow.md)
+- [Live status](/llms.mdx/docs/status.md)
+
+- **Method**
+- [Pentest checklist (mapped to this rig)](/llms.mdx/docs/checklist.md)
+
+- **How it works**
+- [Architecture](/llms.mdx/docs/architecture.md)
+- [HTTPS interception](/llms.mdx/docs/interception.md)
+- [Frida & instrumentation](/llms.mdx/docs/frida.md)
+- [Attestation & keyboxes](/llms.mdx/docs/attestation.md)
+- [Play Integrity (the other attestation)](/llms.mdx/docs/integrity.md)
+- [Root hiding](/llms.mdx/docs/stealth.md)
+
+- **Tools**
+- [Command reference](/llms.mdx/docs/tooling.md)
+- [Static recon](/llms.mdx/docs/recon.md)
+- [Captured flows & replay](/llms.mdx/docs/flows.md)
+- [Snapshots](/llms.mdx/docs/snapshots.md)
+
+- **Reference**
+- [Troubleshooting](/llms.mdx/docs/troubleshooting.md)
+- [Rebuild from scratch](/llms.mdx/docs/rebuild.md)
+- [Glossary](/llms.mdx/docs/glossary.md)

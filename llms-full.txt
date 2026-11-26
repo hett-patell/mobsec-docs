@@ -1,0 +1,1765 @@
+# Architecture (/docs/architecture)
+
+Five layers, each one only there because without it a specific thing fails. The diagram is the fast way to understand the rig; the table below is the "why".
+
+<Mermaid chart="flowchart TB\n  subgraph host[\"Host (Linux Mint)\"]\n      M[mitmdump :18080<br/>mitm/dump.py]\n      T[adb reverse tcp:18080]\n      F[frida CLI 17.27.5]\n      CDP[cdp / session<br/>CDP :9222]\n      R[replay / recon / snap]\n  end\n\n  subgraph emu[\"pentest16 — Android 16 x86_64\"]\n      subgraph zyg[\"Zygote (Zygisk Next)\"]\n          TS[TrickyStore<br/>attestation spoof]\n          PIF[PlayIntegrityFix 4.9]\n          HMA[HMA-OSS<br/>app list filter]\n      end\n      MAG[Magisk 31.1 + su]\n      CF[Cert-Fixer<br/>CA bind-mount]\n      FS[frida-server as 'hluda'<br/>127.0.0.1:27042]\n      APP[Target app<br/>+ WebView]\n  end\n\n  F -->|frida protocol| FS\n  FS --> APP\n  M --- T --- APP\n  M -.->|flows| R\n  CF -.->|trust| APP\n  TS -.->|keystore| APP\n  MAG --> FS\n  MAG --> zyg\n  CDP -->|websocket| APP\n  R -->|replay| M" />
+
+## The layers, in dependency order [#the-layers-in-dependency-order]
+
+### 1. Emulator [#1-emulator]
+
+`pentest16` is a **Play Store** (`google_apis_playstore`) system image for API 36, x86_64, pixel_7 profile, 6 GB RAM, 16 GB data partition. Play Store matters: several attestation-ish code paths check for GMS presence and behave differently without it.
+
+It runs with KVM acceleration (`/dev/kvm`, user in `kvm` group), 4 vCPUs, and GPU on. Boot from cold is ~90 s; from a snapshot, ~25 s.
+
+### 2. Root — rootAVD + Magisk [#2-root--rootavd--magisk]
+
+`rootAVD` patches `ramdisk.img` of the **system image** (not the AVD) with Magisk, then the Magisk app does a second "additional setup" pass on first boot. Result: `su` works, `context=u:r:magisk:s0`.
+
+Magisk 31.1 specifics that bite:
+
+- Built-in Zygisk must be **off** (`magisk --sqlite "replace into settings (key,value) values('zygisk',0)"`) because **Zygisk Next** owns injection.
+- Magisk's denylist is **empty** by design here. Adding an app would strip our modules (TrickyStore, PIF) from exactly the app that needs them.
+- `magisk --denylist rm <pkg> <process>` (two args) **segfaults the daemon**. Use one argument.
+
+### 3. Zygisk modules [#3-zygisk-modules]
+
+| Module | id | Job |
+|---|---|---|
+| Zygisk Next 1.5.3 | `zygisksu` | The injector. `zygiskd` CLI controls policy, memory type, module list. |
+| TrickyStore 1.4.1 | `tricky_store` | Replaces the keystore's attestation certificate chain for packages in `target.txt` using `keybox.xml`. |
+| PlayIntegrityFix 4.9 | `playintegrityfix` | Tries to satisfy Play Integrity. On an emulator: **NO_INTEGRITY**, permanently. |
+| HMA-OSS (Vector-flavoured) | `hma_oss_zygisk` | Hides other installed packages from a target app (root/emulator detector enumeration). |
+| Cert-Fixer 1.1 | `cert-fixer` | Bind-mounts user CAs into `/apex/com.android.conscrypt/cacerts` at `post-fs-data`, so **GMS and Play Store** trust mitmproxy too. |
+| fsrv (ours) | `fsrv` | Renames and autostarts `frida-server` as `/data/adb/fsrv/hluda`, loopback only. |
+
+Zygisk Next's memory type is set to **anonymous** so module libs never appear in `/proc/<pid>/maps` as files.
+
+### 4. Interception [#4-interception]
+
+<Mermaid chart="sequenceDiagram\n  participant App\n  participant Proxy as mitmdump :18080\n  participant Up as upstream\n  App->>Proxy: HTTP/2 CONNECT (adb reverse tunnel)\n  Proxy->>Up: TLS to real server\n  Note over Proxy: dump.py writes /tmp/mtflows/<HHMMSS>_<host>_<path>.txt\n  Proxy-->>App: TLS with mitmproxy CA\n  Note over App: CA trusted because Cert-Fixer mounted it into conscrypt" />
+
+Two details make this painless:
+
+- **`adb reverse`** (device → host), not a proxy on the LAN, so no `http_proxy` is needed for pinned apps. `adb reverse` dies on every reboot; `nettap on` restores it.
+- **Cert-Fixer** mounts the CA at boot for the *whole system*, which is why Play Store and GMS traffic decrypts instead of failing with `does not trust the proxy's certificate`.
+
+### 5. Host tooling [#5-host-tooling]
+
+`pentestctl` (health), `nettap` (proxy+tunnel+addon), `fspawn` (spawn under Frida with a profile), `fdp`/`cdp` (WebView DevTools), `session` (harvest cookies+storage), `replay` (re-issue requests), `recon` (static APK), `snap` (AVD snapshots), `uitap` (UI automation), `asu` (run root snippets).
+
+## What fails if you remove a layer [#what-fails-if-you-remove-a-layer]
+
+| Remove | Symptom |
+|---|---|
+| Cert-Fixer | Chrome/WebView still decrypts (user CA), but **Play Store and GMS** throw TLS handshake errors. |
+| TrickyStore `target.txt` entry | App gets the emulator's fake AOSP chain → server rejects with an attestation error. |
+| Valid keybox | Chain becomes the bundled **software** AOSP keybox (expired intermediate) → server rejects. |
+| `zygiskd enforce-denylist` off | Nothing breaks; denylist simply stops being honoured. |
+| `adb reverse` | App talks to a dead proxy: spinner forever, zero flows. This is the #1 "it broke overnight" cause. |
+| Zygisk Next | No TrickyStore, no PIF, no HMA — attestation spoof and hiding both vanish. |
+
+## Design decisions worth knowing [#design-decisions-worth-knowing]
+
+- **Play Store image over AOSP** — closer to a real device for attestation checks; the cost is a heavier boot and GMS noise in every capture (filtered by `IGNORE` in `dump.py`).
+- **Denylist policy `default`, not `whitelist`** — whitelist mode injects only for listed packages, but WebView renderer sandbox processes (`…:sandboxed_process0`, isolated uid) never match the package name, so every page load failed with `net_error -202`. Tried it, reverted it; see [Root hiding](/docs/stealth#whitelist-trap).
+- **frida-server, not gadget** — gadget needs per-APK patching and re-signing, which changes the APK signature (and some servers check it). Server-side injection leaves the APK untouched.
+- **Loopback-only frida** — `LISTEN=127.0.0.1:27042` + `adb` forwarding. Nothing on the LAN can reach the agent, and no `frida-server` string appears in a listening-socket scan.
+
+# Attestation & keyboxes (/docs/attestation)
+
+This is the part that usually makes people give up on emulator-based testing. A modern app asks the **Android keystore** to generate a key with a server-chosen challenge, and the keystore returns a certificate chain signed by Google's servers describing the device. The app ships that chain to its backend, which decides whether to let you in.
+
+On an emulator that chain says *"Droid Unregistered Device CA, Google Test LLC"* — an obvious emulator. On a real phone it says *"hardware-backed, verified boot green, your device"*. Even with a software keybox the chain is signed by an **expired** AOSP intermediate. Both get rejected.
+
+<Mermaid chart="sequenceDiagram\n  participant App\n  participant KS as Android Keystore\n  participant TS as TrickyStore (Zygisk)\n  participant Srv as Backend\n  App->>KS: generateKey(alias, attestationChallenge)\n  KS->>TS: real chain (or AOSP fake chain)\n  TS-->>App: substituted chain from keybox.xml\n  App->>Srv: POST /login { attestation: { chain: [...] } }\n  Srv->>Srv: verify chain against Google roots + revocation list\n  Srv-->>App: 2000 (accepted) or 4202 (ATTESTATION_UNSUPPORTED)" />
+
+## TrickyStore [#trickystore]
+
+- Module id `tricky_store`, manager UI in `com.example.target`-style apps is not needed — it is driven by two files.
+- `target.txt` — one package per line: **only these apps** get spoofed chains.
+- `keybox.xml` — the replacement chain material (EC and/or RSA), plus the private keys that let the keystore actually sign with it.
+- Reads `tee_status`; on an emulator `teeBroken=true` is expected.
+
+```bash
+adb shell su -c 'cat /data/adb/tricky_store/target.txt'
+adb shell su -c 'grep -o "DeviceID=\"[^\"]*\"" /data/adb/tricky_store/keybox.xml'
+```
+
+<Callout type="info" title="DeviceID is cosmetic — do not read identity into it">
+The `DeviceID` attribute is just a label the upstream keybox author typed. For the public
+`RED-TEAM-KEYBOX` source it is literally a Telegram advert
+(`DeviceID="RKP keybox. Join my group: t.me/redteamchannell"`). TrickyStore never uses it and the
+server validates the **chain**, not the label — so it is normal for it to look like spam and to
+change on every `keybox-refresh`. `pentestctl status` prints it tagged *(cosmetic upstream label)*.
+</Callout>
+
+<Callout type="warn" title="Forgetting target.txt looks like a broken keybox">
+Before adding the package, the app still receives the emulator's own fake chain. The server says *"this device could not be verified"* and you blame the keybox. Add the package, force-stop the app, relaunch — no reboot required.
+</Callout>
+
+## Keybox lifecycle [#keybox-lifecycle]
+
+A usable keybox must satisfy **all** of:
+
+1. Chain signatures verify up to a known root.
+2. Nothing in the chain is **expired**.
+3. The serial numbers are **not on Google's revocation list** (`https://android.googleapis.com/attestation/status`).
+4. It is a **hardware/RKP** chain — the server can tell software chains apart, and they are rejected by anything modern.
+
+Check all four before installing:
+
+```bash
+kbcheck.py --summary /tmp/kb.xml
+# SUMMARY device=<cosmetic upstream label> alg=ecdsa len=4 root=None sig=ok leaf_not_after=2026-12-04 revoked=- expired=-
+kbcheck.py --strict /tmp/kb.xml      # exit 1 unless every check passes
+```
+
+`root=None` is normal: the bundled root bundle (`tools/keybox-res/`) predates the RKP root (`CN=Key Attestation CA1`), so the root *pin* cannot be matched — signatures and revocation still validate, and the server is the real judge.
+
+### The one that works right now [#the-one-that-works-right-now]
+
+```bash
+setup-keybox.sh                       # fetch from upstream, validate, install, back up the old one
+keybox-refresh                        # same thing, but only if it is actually needed
+pentestctl status | grep keybox
+#   --   keybox DeviceID="RKP keybox. Join my group: t.me/redteamchannell" (cosmetic upstream label, not an identity — the chain is what matters)
+#   ok   keybox leaf valid until 2026-12-04 (8d left)
+```
+
+Source: `redteam-git/RED-TEAM-KEYBOX` publishes a base64 blob at `…/main/conf` (refreshed every 4 h upstream). `setup-keybox.sh --file <xml>` installs a local file; `--check` validates only.
+
+### Keeping it alive: `keybox-refresh` [#keeping-it-alive-keybox-refresh]
+
+Keyboxes die quietly — the leaf expires and the server starts answering `4202` again with no other symptom. `keybox-refresh` is the boring fix:
+
+```bash
+keybox-refresh                 # refresh only if < 7 days left, revoked, or already expired
+keybox-refresh --force         # refresh now, e.g. when the target starts refusing you
+keybox-refresh --min-days 20   # keep a wider safety margin
+keybox-refresh --dry-run       # validate the device keybox and print what it would do
+```
+
+How it behaves:
+
+1. Reads the device keybox, runs `kbcheck.py --summary` (`device=… leaf_not_after=… sig=… revoked=…`).
+2. Stays put unless the keybox is close to expiry or already dead.
+3. Tries sources in order — `redteam`, then `yuri` — accepting only payloads that `kbcheck.py --strict` accepts (signatures, chain, expiry, of the revocation list).
+4. Backs up the old keybox as `keybox.xml.bak_<ts>` and force-stops `com.example.target`, `com.android.vending`, `com.google.android.gms` so they re-open the keystore.
+5. Appends to `~/.mobsec/keybox.log`.
+
+It runs automatically through a **systemd user timer** (`mobsec-keybox.timer`: 10 min after boot, then daily with a randomised delay, `Persistent=true`):
+
+```bash
+systemctl --user list-timers | grep mobsec
+systemctl --user start mobsec-keybox.service    # run it now
+journalctl --user -u mobsec-keybox.service -n 20
+```
+
+The current leaf expires **2026-12-04**; `pentestctl status` prints the remaining days on every run, so the timer is a safety net and not the primary signal.
+
+### Anatomy of a rejected keybox (real example) [#anatomy-of-a-rejected-keybox-real-example]
+
+The well-known Yurikey keybox had a perfect hardware chain — and its leaf serial `bb0d83fa2a47a1ae54c8c359778aaf35` was on Google's revocation list (2222 entries). Everything looked right in the UI, and the server still said no. Always check revocation, not just expiry.
+
+## What the server actually validates [#what-the-server-actually-validates]
+
+From the target app's behaviour, in order of strictness:
+
+1. Chain parses and every signature verifies.
+2. Leaf public key matches the challenge-signed data.
+3. Chain contains Google's RKP attestation extension (hardware root of trust).
+4. No serial is revoked, nothing expired.
+5. Sometimes: `verifiedBootState` = green, `deviceLocked` = true, `osVersion` sane.
+
+TrickyStore supplies 1–5 for keystore users, but the **revocation list** is checked server-side and cannot be spoofed locally. That is why a revoked keybox is worthless even though the UI shows a beautiful chain.
+
+## Verifying on-device [#verifying-on-device]
+
+Install **KeyAttestation** (`io.github.vvb2060.keyattestation`, in `apks/`) and generate a key:
+
+- ✅ expected: `CN=App Attest Key` issued by `O=TEE,CN=<32 hex>`, "Bootloader is locked", manufacturer from the keybox, ~32 certs issued in the last 30 days.
+- ⚠️ expected on this rig: banner *"Unknown root certificate — root is not a known trusted CA"*. Its local root pool does not contain the RKP root; the target server's does. Not a failure.
+- ❌ if you see `CN=Android Keystore Software Attestation Intermediate`: `target.txt` is missing the package, or `keybox.xml` is the bundled software one.
+
+## Play Integrity is a different problem [#play-integrity-is-a-different-problem]
+
+Play Integrity's `MEETS_DEVICE_INTEGRITY` cannot be faked on an emulator; measured here as **UNEVALUATED** (Google declines to grade an emulator with no account) before and after PlayIntegrityFix. This rig does not solve PI, and does not need to for apps that use raw key attestation. The mechanics, the `integrity` tool and the escape routes are on the [Play Integrity](/docs/integrity) page.
+
+<Callout type="info" title="x86_64 gotcha">
+`PlayIntegrityFork` v19 ships only arm64/armv7 `zygisk` libs, so on this x86_64 image it silently never loads (`zygiskd status` stops listing `playintegrityfix`). The installed module is `PlayIntegrityFix_v4.9-inject-s.zip`, which does ship x86_64. v19 is parked in `modules/archive/`.
+</Callout>
+
+# Pentest checklist (mapped to this rig) (/docs/checklist)
+
+This is the HackTricks/OWASP-MASTG Android checklist, rewritten as *"which command in this rig does that, and where does it stop working"*. Use it so you do not reinvent steps — and so you do not claim coverage the emulator cannot give you.
+
+Legend: **✔** a command does it · **~** partial, read the note · **✘** impossible or pointless here.
+
+## 1. Before you install anything (static) [#1-before-you-install-anything-static]
+
+| Check | Command | |
+|---|---|---|
+| What is it, who signed it, which SDKs | `recon app.apk` | ✔ |
+| Obfuscation / packer / anti-VM hints | `recon` → Packers section (`apkid`) | ✔ |
+| `APKiD` says `anti_vm` / `anti_debug` | verify by hand in jadx — it fires on Google/Firebase/Material library code | ~ |
+| Secrets, API keys, endpoints in DEX/resources | `recon --deep`, then `apkleaks` section | ✔ |
+| Rule-based SAST (Weak crypto, WebView, backup flags…) | `recon` → `mobsfscan` | ✔ |
+| Manifest triage: exported components, deep links, `allowBackup`, `dataExtractionRules`, `networkSecurityConfig`, `usesCleartextTraffic`, `debuggable` | `recon` (summary) + `entry` (attack sheet) | ✔ |
+| App Links / `assetlinks.json` | `entry` → "App links on this device" | ✔ |
+| Native libs + CVEs | `apkanalyzer apk summary`, `unzip -l`; CVE mapping by hand | ~ |
+| Cross-platform framework (Flutter/RN/Tauri/Cordova) | `find lib/ -name '*.so'`; Tauri = `libapp_lib.so` + remote web UI | ✔ |
+| Decompile for source review | `jadx-gui app.apk` (or `apktool d`) | ✔ |
+| Sideloaded/store differences | compare APKs from Play vs vendor — Play App Signing changes the signing key | ~ |
+
+## 2. Install and get it running [#2-install-and-get-it-running]
+
+| Check | Command | |
+|---|---|---|
+| Get past root/emulator detection | `fspawn <pkg> intercept` (HTTP Toolkit set: root detection off, pinning off, proxy overridden) | ✔ |
+| Get past key attestation | `setup-keybox.sh` / `keybox-refresh`, target listed in `/data/adb/tricky_store/target.txt` | ✔ |
+| Get past Play Integrity | see [Play Integrity](/docs/integrity) — not passable on an emulator | ✘ |
+| Force the app to talk to you | `nettap on` (proxy + reverse + addon), then use the app | ✔ |
+| Launch an exported activity/service/receiver | `entry <pkg> --run` | ✔ |
+| See what it does with a URL | `entry <pkg> --only links` | ✔ |
+
+## 3. Runtime: storage [#3-runtime-storage]
+
+| Check | Command | |
+|---|---|---|
+| Private dir, sqlite, prefs, webview store | `pull-data <pkg>` (`--sql`, `--grep`) | ✔ |
+| What is *actually* in the databases | `sqlite3 ~/.mobsec/data/<pkg>/…/foo.db .dump` | ✔ |
+| Session/refresh tokens at rest | `pull-data --grep token` → then decrypt by hand if needed | ✔ |
+| Keystore-backed keys | `fspawn <pkg> attest` (`20-keystore.js` dumps subject/issuer of generated chains) | ✔ |
+| "Keystore is hardware-backed" claim | KeyAttestation app → see [Attestation](/docs/attestation) | ✔ |
+| `adb backup` extraction | blocked on API 31+ unless the app opts in; use `pull-data` instead | ~ |
+| External storage / shared prefs | `pull-data` also pulls `/sdcard/Android/data/<pkg>` | ✔ |
+
+## 4. Runtime: network [#4-runtime-network]
+
+| Check | Command | |
+|---|---|---|
+| Full request set, decrypted | `nettap on` + `flows` (files in `/tmp/mtflows`, index in `_index.jsonl`) | ✔ |
+| Pinning | `fspawn <pkg> intercept` | ✔ |
+| Proxy-unaware / native traffic | same profile (in-process proxy override) | ✔ |
+| WebSocket / GraphQL over WS | flows capture the handshake; `cdp watch` shows app-side messages | ~ |
+| Edit and re-send a request | `replay --grep PATH --patch 'field=value'` | ✔ |
+| IDOR / authz testing | `snap list` → clone the AVD, log in as user B (`ANDROID_SERIAL`), replay user A's requests | ~ |
+| MQTT/gRPC/QUIC/bluetooth | nothing here terminates those; check the app's protocol first | ✘ |
+
+## 5. Runtime: WebView / hybrid apps [#5-runtime-webview--hybrid-apps]
+
+| Check | Command | |
+|---|---|---|
+| DOM, localStorage, sessionStorage, cookies | `fdp` then `cdp eval 'location.href'` / `session harvest` | ✔ |
+| Console + network of the web layer | `cdp watch 30` | ✔ |
+| `addJavascriptInterface` bridges | `fspawn <pkg> web` shows console; grep the bundle for the bridge name | ~ |
+| Client-side authz enforced in JS | read the bundle: `grep -o 'plugin:[^"]*' *.js` finds Tauri/Electron IPC commands | ✔ |
+| Deep links into the web layer | `entry` + `cdp eval 'location.href="/route"'` | ✔ |
+
+## 6. Runtime: components and injection [#6-runtime-components-and-injection]
+
+| Check | Command | |
+|---|---|---|
+| Exported components reachable, permission NOT enforced | `entry <pkg> --run`, watch logcat | ✔ |
+| Content provider data leak | `entry` provider lines (`content query --uri …`) — note `exported=false` + `grantUriPermissions=true` needs a grant | ~ |
+| Task hijacking / StrandHogg | needs a real launcher and a second malicious app — out of scope for this rig | ✘ |
+| Tapjacking / overlay attacks | needs overlay permissions and a real UI; emulator OK but no template here | ✘ |
+| Dynamic instrumentation | `fspawn <pkg> trace\|attest\|web\|spy` | ✔ |
+| Root/emulator checks firing | `fspawn <pkg> trace` → `30-rootcheck.js` prints each path/API queried | ✔ |
+
+## 7. Server side (where the money usually is) [#7-server-side-where-the-money-usually-is]
+
+| Check | Command | |
+|---|---|---|
+| Endpoint inventory | `flows` index + `recon --deep` endpoints, diffed | ✔ |
+| Authz: object ownership | `replay` with another user's ids | ✔ |
+| Mass assignment / field injection | `replay --patch` | ✔ |
+| Rate limits / lockout | `replay` in a loop, watch status codes | ✔ |
+| MFA weaknesses | `session harvest` → inspect `/auth/session`-style endpoints for seeds/tokens | ✔ |
+| Logout / session invalidation | `replay` the logout, then reuse the cookie | ✔ |
+
+## 8. What this rig cannot tell you [#8-what-this-rig-cannot-tell-you]
+
+- Anything hardware-backed that you did not spoof: sensors, Secure Element, StrongBox, real TEE behaviour.
+- Play Integrity verdicts ([why](/docs/integrity)).
+- Bluetooth, NFC, USB, SIM/telephony behaviour.
+- OEM-specific bugs (the emulator is AOSP + Google image, no vendor blobs).
+- Performance/timing side channels that depend on real CPU and memory pressure.
+- Whether a leaked key matters — that is a server-side validation question, and the answer changes per target.
+
+## Reporting habit [#reporting-habit]
+
+For every finding, keep the evidence triple: **the flow file** (`/tmp/mtflows/…txt`), **the replay command** that reproduces it, and **the app state** (which `snap` image, which user, which Frida profile). `_index.jsonl` plus a one-line `replay` command is the cheapest possible repro packet.
+
+# Captured flows & replay (/docs/flows)
+
+Every interesting request on the device ends up as a file in `/tmp/mtflows` (change with `FLOWDIR`). Those files are the raw material for everything else: analysis, replay, fuzzing, evidence.
+
+## Format [#format]
+
+One file per flow, named `<HHMMSS>_<host>_<path>.txt`:
+
+```text
+POST https://crmbff.example.com/auth/mobile/login
+
+--REQ HEADERS--
+Headers[(b'content-type', b'application/json'), (b'cookie', b'mtpo.crm=…'), …]
+
+--REQ BODY--
+{"userName":"…","password":"…","attestation":{"chain":[ … ]}}
+
+--RESP 200--
+Headers[(b'content-type', b'application/json'), …]
+
+--RESP BODY--
+{"code":2000,"data":{…}}
+```
+
+Notes:
+
+- The headers block is mitmproxy's `Headers` repr on **one line** — parse with `ast.literal_eval` after stripping the `Headers` prefix (that is what `replay` does).
+- Bodies are truncated at `MAXBODY` (20 000 bytes) but the index records the real lengths.
+- Two hosts with the same path no longer collide: the host is part of the name, and a `-2`/`-3` suffix is added if the same second produces the same host+path.
+- Names carry no date (only `HHMMSS`), so **never sort flows by name across days** — `session`, `replay` and `snap` sort by mtime.
+
+## The index [#the-index]
+
+```bash
+tail -3 /tmp/mtflows/_index.jsonl
+```
+
+```json
+{"ts": 1795530833, "file": "200353_example_com__.txt", "host": "example.com", "method": "GET", "path": "/s.js", "status": 200, "req_len": 0, "resp_len": 1379}
+```
+
+Quick analysis:
+
+```bash
+# API surface, most frequent first
+jq -r '"\(.method) \(.host)\(.path)"' /tmp/mtflows/_index.jsonl | sed 's/[0-9a-f]\{8,\}/<id>/g' | sort | uniq -c | sort -rn | head -30
+
+# errors only
+jq -r 'select(.status >= 400) | "\(.status) \(.method) \(.host)\(.path)"' /tmp/mtflows/_index.jsonl | sort | uniq -c | sort -rn
+
+# what got sent where with a body
+jq -r 'select(.req_len > 0) | "\(.req_len) \(.method) \(.host)\(.path)"' /tmp/mtflows/_index.jsonl | sort -rn | head
+```
+
+## Replay [#replay]
+
+`replay` re-issues a captured request from the host, defaulting to *exactly* what the app sent, with explicit overrides:
+
+```bash
+replay --grep 'auth/session'                      # newest match
+replay --grep 'auth/session' --session            # inject harvested cookie
+replay --grep 'auth/session' --dry                # print, do not send
+replay --grep 'chat/messages' --patch 'conversationId="<other>"'   # IDOR probe
+replay --grep X --remove-header authorization --dry
+replay --grep X -x                                # through mitmproxy → new flow
+```
+
+Patch syntax is a small JSONPath: `a.b`, `items[0].id`, `a.b[2].c`. Values are parsed as JSON when possible (`42`, `true`, `"str"`), else kept as strings.
+
+Every `--patch` run should start with `--dry`. It prints the method, URL, headers and the first 300 bytes of body — enough to catch a typo before you send something destructive to a production backend.
+
+## Why this beats Burp here [#why-this-beats-burp-here]
+
+- **Same headers** as the app, including device-specific ones and the cookie jar state at capture time.
+- **Attestation-friendly**: capture the login once, replay everything else; you never need a fresh keystore challenge for non-login endpoints.
+- **Evidence-friendly**: `-x` re-sends through mitmproxy, so the attempt lands in the same flow corpus with a timestamp.
+
+## Token harvesting [#token-harvesting]
+
+`session` merges the WebView's `document.cookie`, `localStorage` and `sessionStorage` with the newest captured `Cookie` header (httpOnly cookies are invisible to JS):
+
+```bash
+session              # writes ~/.mobsec/session/<ts>.json and latest.json
+session show
+replay --grep 'chat/loadInitialData' --session
+```
+
+Storage layout:
+
+```json
+{"cdp": {"url": "…", "cookie": "…", "localStorage": {…}, "sessionStorage": {…}},
+ "flow": {"file": "…", "cookie": "…"}}
+```
+
+## Spotting the interesting things [#spotting-the-interesting-things]
+
+Patterns worth grepping for in a fresh corpus:
+
+```bash
+grep -rlE '"(role|isAdmin|permissions)"' /tmp/mtflows/*.txt | head
+grep -rl 'secret\|token\|otp\|mfa' /tmp/mtflows/*.txt | head
+grep -rhoE '"https?://[^"]+"' /tmp/mtflows/*.txt | sort -u | head -40      # third-party surface
+grep -rh 'set-cookie' /tmp/mtflows/*.txt | sort -u | head                  # flags: HttpOnly? Secure? SameSite?
+```
+
+And the classic: compare what a **low-privilege** account gets versus a **high-privilege** one for the same endpoint — same request, two cookies, diff the bodies.
+
+# Frida & instrumentation (/docs/frida)
+
+Frida is not "installed" here, it is **wired**: the agent autostarts as a Magisk module under a different name, listens on loopback only, and the host side is a set of script profiles that answer specific questions.
+
+## The device side [#the-device-side]
+
+| Piece | Path |
+|---|---|
+| Binary | `/data/adb/fsrv/hluda` (renamed `frida-server`, 17.27.5, x86_64) |
+| Config | `/data/adb/fsrv/conf` → `AUTOSTART=1`, `LISTEN=127.0.0.1:27042` |
+| Control | `/data/adb/fsrv/ctl start\|stop\|status` |
+| Module | `/data/adb/modules/fsrv` (starts it from `service.sh`) |
+
+```bash
+adb shell su -c '/data/adb/fsrv/ctl status'     # running pid=2180 listen=127.0.0.1:27042
+frida-ps -U | head
+```
+
+Renaming matters: the string `frida-server` and the default port `27042` are what most detectors grep for in `/proc/net/tcp`, process lists and file paths. `hluda` is what a heavily-used public build calls itself; on loopback it is also invisible to the LAN.
+
+## The host side [#the-host-side]
+
+`frida` + `frida-tools` 17.27.5 (pipx), `objection` available for quick jobs, and these wrappers:
+
+```bash
+fspawn <pkg> [profile] [frida args…]   # force-stop, spawn under frida with a script set
+fdp [pkg] [port]                       # discover webview_devtools_remote_<pid>, adb forward
+cdp url | eval "<js>" | watch [secs]   # Chrome DevTools Protocol client for the WebView
+session                                # harvest cookies/localStorage/sessionStorage
+```
+
+### Profiles [#profiles]
+
+| Profile | Scripts | Use it for |
+|---|---|---|
+| `trace` | core, webview-debug, rootcheck, tls | first look: what does this app touch, what does it check |
+| `web` | core, webview-debug | WebView/Tauri/Cordova apps — enables CDP |
+| `attest` | core, keystore | key generation, attestation challenge, chain dump |
+| `spy` | core, webview-debug + 3 Medusa modules | anti-root bypass, OkHttp logging, SQLite queries |
+| `intercept` | 9 HTTP Toolkit scripts | pinning bypass + proxy override + CA injection + root-detect off |
+| `full` | everything local | kitchen sink; expect noise |
+| `raw` | none | isolate whether a script is the problem |
+
+### The local script set [#the-local-script-set]
+
+| File | What it hooks |
+|---|---|
+| `00-core.js` | logging helpers on `globalThis`, process/arch info, a **filtered** exception handler (only reports faults in app-owned libs, capped at 5 — Frida 17 removed `global`; use `globalThis`) |
+| `05-webview-debug.js` | `WebView.setWebContentsDebuggingEnabled(true)`, console messages, URL loads |
+| `10-jni.js` | scans loaded classes for `tauri`/`plugin` classes, wraps methods, lists `libapp_lib.so` symbols matching `permanent_login|attest|secure_storage|plugin` |
+| `20-keystore.js` | `KeyGenParameterSpec.setAttestationChallenge` / `setIsStrongBoxBacked`, `KeyStore.getCertificateChain` subject/issuer dump |
+| `30-rootcheck.js` | `File.exists/canRead/canExecute/isFile/isDirectory` on su/magisk/frida/xposed paths, `Runtime.exec`, `getPackageInfo`, `Debug.isDebuggerConnected`, `Build` fields |
+| `40-tls.js` | `SSLContext.init` trust managers, `NetworkSecurityPolicy`; `--bypass` = trust-all |
+
+```bash
+# with extra args, everything after the profile is passed to frida
+fspawn com.example.app trace --runtime=v8
+fspawn com.example.app raw -l ~/my-script.js
+```
+
+## Background runs [#background-runs]
+
+Frida's REPL needs a tty. `frida -U -f pkg < /dev/null` exits immediately, and `pkill -f 'frida -U -f pkg'` can kill the shell that issued it. Use a fifo:
+
+```bash
+mkfifo /tmp/f; sleep 900 > /tmp/f &
+fspawn com.example.app intercept < /tmp/f > /tmp/frida.log 2>&1 &
+tail -f /tmp/frida.log
+```
+
+## WebView = CDP [#webview--cdp]
+
+For hybrid apps this is the highest-value tool in the rig: no hooks, full DOM, console, network view and storage.
+
+```bash
+fspawn com.example.app web
+fdp com.example.app          # pid=9918 socket=webview_devtools_remote_9918 -> http://127.0.0.1:9222
+cdp url                      # {"id":…, "url":"https://app.example.com/chat", "title":"App"}
+cdp eval "JSON.stringify(Object.keys(localStorage))"
+cdp eval "document.cookie"
+cdp watch 15                 # stream console + network events for 15 s
+```
+
+`session` uses the same channel to merge `document.cookie`, `localStorage` and `sessionStorage` with the newest captured `cookie` header (httpOnly cookies never show up in JS).
+
+## Stolen modules (Medusa) [#stolen-modules-medusa]
+
+`tools/medusa` is a vendored copy; `bin/medusa-export` converts its JSON modules into standalone JS:
+
+```bash
+medusa-export list
+medusa-export export --set core      # writes frida/medusa/*.js
+medusa-export export http_communications__okhttp3_retrofit
+```
+
+Medusa's modules assume the framework's helpers (`colorLog`, `Module.findExportByName`). The exporter injects a shim: `Color`, `colorLog`, `Options` defaults, `__mod('libc.so', …)`, plus Frida-17 polyfills for `Module.findExportByName` / `getExportByName`.
+
+<Callout type="error" title="`file_system__shared_preferences` crashes WebView apps">
+It replaces `getSharedPreferences()` globally and Chromium then dies with
+`NullPointerException: … SharedPreferences$Editor.apply() on a null object reference`.
+Keep it out of profiles for any app with a WebView; load it by hand only for native-only apps.
+</Callout>
+
+## When Frida itself is the problem [#when-frida-itself-is-the-problem]
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Failed to spawn: unable to find process` | package not installed / wrong user | `adb shell pm list packages \| grep name` |
+| spawns then instantly detaches | script threw at load | run profile `raw`, then add scripts one by one |
+| `access-violation` spam | the exception handler reporting ART's own SIGSEGVs | already filtered in `00-core.js`; check the PC is in an app lib |
+| `frida-ps` hangs | server died (OOM, or killed by a detector) | `/data/adb/fsrv/ctl start` |
+
+# Glossary (/docs/glossary)
+
+**adb reverse** — forwards a port on the *device* to the host. Used so the app can reach mitmproxy on `127.0.0.1:18080` without a LAN proxy. Dies on every reboot.
+
+**Attestation chain** — certificate chain returned by the Android keystore for a generated key: leaf (app key) → TEE intermediate → Droid CA → Google root. Encodes device identity, lock state and verified-boot status.
+
+**AVD** — Android Virtual Device. Here: `pentest16`, pixel_7 profile, API 36 Play Store image.
+
+**Bootloader locked / verified boot** — properties the server can read from the attestation extension. TrickyStore's keybox decides what the server sees.
+
+**CDP** — Chrome DevTools Protocol. Over `adb forward :9222` it gives DOM, console, storage and network for any debuggable WebView.
+
+**Cert-Fixer** — Magisk module that bind-mounts user CAs into `/apex/com.android.conscrypt/cacerts` at `post-fs-data`, so system apps (GMS, Play Store) trust mitmproxy.
+
+**conscrypt** — Android's TLS provider and the place the system trust store lives since Android 14 (moved out of `/system/etc/security/cacerts`).
+
+**denylist (Magisk)** — packages that get *no* module injection. Empty in this rig on purpose: TrickyStore/PIF must reach the target app.
+
+**denylist policy (Zygisk Next)** — `default` (inject everywhere except denylisted) or `whitelist` (inject only listed). Whitelist breaks WebView renderer sandboxes.
+
+**frida-server** — the on-device agent. Here renamed `hluda`, autostarted by the `fsrv` Magisk module, listening on loopback only.
+
+**gadget** — Frida's injectable library for non-rooted devices; requires patching and re-signing the APK, which changes its signature. Not used here.
+
+**HMA-OSS** — "Hide My Applist" fork: hides installed packages from a target app's enumeration. Installed, hide list empty.
+
+**keybox.xml** — TrickyStore's replacement cert+key material: EC and/or RSA chains plus private keys. Must be hardware (RKP), unexpired and unrevoked.
+
+**keybox revocation list** — Google's published serial blacklist at `android.googleapis.com/attestation/status`. Server-side check; cannot be spoofed locally.
+
+**KVM** — kernel virtual machine; `/dev/kvm` + `kvm` group membership makes the emulator usable.
+
+**Magisk** — systemless root. Version 31.1 here, applied to the system image's ramdisk via rootAVD.
+
+**mitmproxy / mitmdump** — the intercepting proxy. `mitm/dump.py` addon writes one file per flow.
+
+**Play Integrity (PI)** — Google's app-level integrity API (device/app/account verdicts). Emulator → `NO_INTEGRITY`; not solvable here.
+
+**PIF (PlayIntegrityFix)** — module that tries to satisfy PI by spoofing props; on an emulator it still fails.
+
+**post-fs-data** — earliest Magisk boot stage; where Cert-Fixer mounts CAs.
+
+**RKP** — Remote Key Provisioning. Modern hardware attestation where keys/certs are provisioned by Google per device.
+
+**rootAVD** — script that patches an AVD's `ramdisk.img` with Magisk; modifies the system image, not the AVD config.
+
+**snapshot (AVD)** — full VM state save/restore (`adb emu avd snapshot save`). ~5 GB, ~25 s restore.
+
+**TrickyStore** — Zygisk module that substitutes keystore attestation chains for packages in `target.txt` using `keybox.xml`.
+
+**TEE** — Trusted Execution Environment; hardware side that produces attestation. Emulators fake it (`teeBroken=true`).
+
+**Zygisk** — Magisk's code-injection mechanism into zygote-spawned apps. Disabled in Magisk itself here; **Zygisk Next** provides it.
+
+**zygiskd** — Zygisk Next's control CLI (`status`, `enforce-denylist`, `denylist-policy`, `memory-type`).
+
+**`Zygisk-Assistant`** — popular root-hiding module. Not used: it requires targets in Magisk's denylist, which strips our spoofing modules from those same apps.
+
+# mobsec — an Android pentest rig that actually works (/docs)
+
+A rooted Android 16 emulator on this laptop, wired end to end: **HTTPS decrypted**, **Frida attached from the first instruction**, **root hidden**, and **hardware-backed key attestation spoofed** well enough that a real bank-grade server accepts the login.
+
+Everything here runs locally. No cloud, no extra hardware, ~20 GB of disk.
+
+<Callout type="warn" title="Authorised testing only">
+The attestation layer makes this device claim to be a different physical phone, and the keybox in use is not ours. Use it against apps you are permitted to test. Nothing in this rig is anonymous: traffic goes out from your own IP.
+</Callout>
+
+## What you get [#what-you-get]
+
+| Capability | How | Page |
+|---|---|---|
+| Android 16 x86_64 emulator, Play Store image | `pentest16` AVD (pixel_7, 6 GB RAM, 16 GB data) | [Quickstart](/docs/quickstart) |
+| Root + Magisk modules | rootAVD + Magisk 31.1, Zygisk Next, TrickyStore, PIF 4.9, Cert-Fixer | [Architecture](/docs/architecture) |
+| HTTPS interception for *every* app | mitmproxy + system CA bind-mounted into `conscrypt` | [Interception](/docs/interception) |
+| Certificate pinning bypass | HTTP Toolkit script set via `fspawn … intercept` | [Interception](/docs/interception#pinning) |
+| Frida, ready in one command | `frida-server` as a Magisk module + script profiles | [Frida](/docs/frida) |
+| WebView DOM, console, storage access | Chrome DevTools Protocol over `adb forward` | [Frida](/docs/frida#webview) |
+| Capture → edit → replay any request | `nettap` + `replay` harness | [Flows](/docs/flows) |
+| Hardware key attestation spoofing | TrickyStore + a valid RKP keybox | [Attestation](/docs/attestation) |
+| Root/emulator hiding | Zygisk denylist policy, anonymous memory, HMA-OSS scoped per target | [Root hiding](/docs/stealth) |
+| Play Integrity verdicts, measured | `integrity` (drives SPIC, scrapes logcat) | [Play Integrity](/docs/integrity) |
+| Exported components → ready-to-run adb commands | `entry` (manifest → attack sheet) | [Command reference](/docs/tooling#entry) |
+| App private storage off the device | `pull-data` (root tar + sqlite/prefs summary) | [Command reference](/docs/tooling#pull-data) |
+| A checklist that maps to these commands | HackTricks/MASTG in rig terms | [Pentest checklist](/docs/checklist) |
+| Static APK recon in one command | `recon` (apkid + apkleaks + mobsfscan + jadx) | [Static recon](/docs/recon) |
+| Instant return to a logged-in state | AVD snapshots | [Snapshots](/docs/snapshots) |
+
+## 30-second health check [#30-second-health-check]
+
+```bash
+pentestctl status
+```
+
+```text
+device        ok   emulator-5554  sdk_gphone64_x86_64  android 16 sdk 36
+root          ok   uid=0(root) ... context=u:r:magisk:s0
+zygisk        ok   inject_state=1  denylist_policy=0  enforce=1  memory=1
+attestation   --   keybox DeviceID="RKP keybox. Join my group: …" (cosmetic)   ok   leaf valid until 2026-12-04 (8d left)
+frida         ok   frida-server running pid=2180 listen=127.0.0.1:27042
+interception  ok   mitmdump up   adb reverse ok   proxy 127.0.0.1:18080
+```
+
+If something is red, `pentestctl fix` repairs the two things that break on every reboot (`adb reverse` and the mitm addon), then see [Troubleshooting](/docs/troubleshooting).
+
+## The one-paragraph mental model [#the-one-paragraph-mental-model]
+
+The emulator boots a **Magisk-patched ramdisk**, so `su` works from the first second. Magisk loads three Zygisk modules that matter: **TrickyStore** fakes the hardware keystore's attestation chain for packages listed in `target.txt`, **PlayIntegrityFix** tries (and fails, on an emulator) to satisfy Play Integrity, and **Zygisk Next** does the injecting in anonymous memory. **Cert-Fixer** bind-mounts our mitmproxy CA into every process's trust store, including system ones. **frida-server** runs renamed as `hluda` under a small custom module, listening on loopback only. On the host, `nettap` keeps mitmproxy and the `adb reverse` tunnel alive, `fspawn` starts an app under Frida with a chosen script profile, and `replay` re-issues anything you captured.
+
+## Where things live [#where-things-live]
+
+```text
+~/mobsec/                  the rig (this repo of scripts + docs)
+├── bin/                   pentestctl, nettap, fspawn, fdp, cdp, session, replay, recon,
+│                        entry, pull-data, integrity, hma, keybox-refresh, docs, snap, uitap, asu
+├── frida/                 instrumentation scripts (+ httptoolkit/, medusa/)
+├── mitm/                  dump.py addon (flow capture)
+├── modules/               Magisk module zips
+├── tools/                 frida-server, jadx, apktool, kbcheck.py, keybox roots
+├── docs/                  this site
+└── build/                 fsrv module (frida autostart)
+
+~/Android/Sdk/             Android SDK (patched system image lives here)
+~/.android/avd/pentest16*  the emulator
+/tmp/mtflows/              captured flows (txt + _index.jsonl)
+~/.mobsec/session/         harvested cookies/tokens
+~/.mobsec/recon/           static analysis reports
+```
+
+## Start reading here [#start-reading-here]
+
+1. [Quickstart](/docs/quickstart) — a device that is already built, or build it from zero.
+2. [Daily workflow](/docs/workflow) — the loop you will actually repeat.
+3. [Architecture](/docs/architecture) — why each layer exists, and what breaks without it.
+
+# Play Integrity (the other attestation) (/docs/integrity)
+
+Two different things get called "attestation" in Android pentests, and confusing them wastes days:
+
+| | What it proves | Who checks it | Can this rig fake it? |
+|---|---|---|---|
+| **Key attestation** (Android Keystore / RKP) | "this key lives in a TEE on a device whose boot state is X" | your target's backend, per-request | **Yes** — TrickyStore + keybox, see [Attestation](/docs/attestation) |
+| **Play Integrity** (`IntegrityManager.requestIntegrityToken`) | "this APK, installed from Play, on a Google-approved device, right now" | Google evaluates, your backend reads the verdict JSON | **No**, not on an emulator |
+
+Play Integrity is Google's own server-side verdict. You cannot compute it locally, and the request only works for a Play-distributed, Play-signed app with a Play Console project — which is why pentest tooling ships its own checker APK.
+
+## Measuring it on this rig [#measuring-it-on-this-rig]
+
+```bash
+integrity          # taps the button in SPIC, scrapes the verdict JSON from logcat
+integrity --json          # raw verdict
+```
+
+`integrity` drives **SPIC** (`com.henrikherzig.playintegritychecker`, in `apks/`): force-stops it, launches it, finds the "Make Play Integrity Request" button via `uiautomator dump`, taps it, and parses the JSON block SPIC prints to `I/System.out` (that is where the library dumps the token payload).
+
+Measured on this AVD, twice, before and after PlayIntegrityFix:
+
+```text
+package           : com.henrikherzig.playintegritychecker
+app recognition   : UNEVALUATED
+device verdict    : —
+recent activity   : UNEVALUATED
+app licensing     : UNEVALUATED
+play protect      : UNEVALUATED
+```
+
+`UNEVALUATED` (and a *missing* `deviceRecognitionVerdict`) is not an error in the rig. Logcat shows the request itself succeeding:
+
+```text
+I/Finsky: Integrity key attestation record generated successfully
+I/Integrity: requestIntegrityToken() finished for com.henrikherzig.playintegritychecker
+```
+
+Google receives the request and declines to grade it: the device is an emulator and **no Google account is signed in**. Both conditions must be satisfied for a verdict to exist at all — and even with an account, a Play Store emulator image still cannot return `MEETS_DEVICE_INTEGRITY`.
+
+<Callout type="info" title="Creating a Google account on the AVD is not worth it">
+It removes the `UNEVALUATED` state and replaces it with a clean `MEETS_BASIC_INTEGRITY` / no `DEVICE` result. It does not unlock anything, and it puts a real account on a rooted emulator.
+</Callout>
+
+## The modules, and why they do not help here [#the-modules-and-why-they-do-not-help-here]
+
+- **PlayIntegrityFix 4.9** (`playintegrityfix`) patches device props in GMS's process so DroidGuard is less likely to notice the emulator. It is installed and loading (`zygiskd status` lists it) — it just cannot manufacture a device verdict that Google refuses to issue.
+- **PlayIntegrityFork v19** is parked in `modules/archive/`: it ships **only** `arm64-v8a` and `armeabi-v7a` Zygisk libs, so on this x86_64 image it silently never loads. Watch for that class of bug with `zygiskd status` after every module change — the module staying absent from `modules64:` is the tell.
+- **TrickyStore** fakes the keystore chain. Play Integrity's `STRONG_INTEGRITY` needs a hardware-backed signature over the *app signing key* by a Google-trusted root — key attestation spoofing gets you partway, then Google's own evaluation of the resulting record is the wall.
+- **TEESimulator** (JingMatrix, GPL-3.0) is the current community answer: a software KeyMint that needs a keybox, designed for exactly this "make a non-device look like a device" problem. It is a candidate upgrade for this rig; it is not installed, and it would still be fighting Play's verdict rather than key attestation.
+
+## When your target actually gates on Play Integrity [#when-your-target-actually-gates-on-play-integrity]
+
+In order of cost:
+
+1. **Check it is really PI.** If the app also sends a key-attestation chain (Tauri/Rust/native apps often do), the keybox path already covers you — Target is exactly this case.
+2. **Frida-hook the client side.** `IntegrityManager.requestIntegrityToken` / the verdict parser in the app: hook the callback and hand back a verdict the app likes. Works only when the backend trusts the *client* to inspect the verdict, which is a bug worth reporting in itself.
+3. **Replay with a good token.** `session` + `replay` let you re-issue the request with a token minted on a clean device — that is the same thing a real attacker does, and it demonstrates the missing server-side binding.
+4. **Use a physical device.** No emulator configuration passes `MEETS_DEVICE_INTEGRITY`; that is the point of the product.
+
+## Related traps [#related-traps]
+
+<Callout type="warn" title="`integrity` needs the screen awake and unlocked">
+`uiautomator dump` returns nothing useful on a locked screen, and the tap lands nowhere. `adb shell input keyevent KEYCODE_WAKEUP` first if the AVD has been idle.
+</Callout>
+
+<Callout type="warn" title="SPIC's JSON block ends at an *unindented* `}`">
+The verdict is a multi-line pretty-printed document in logcat. Closing braces of nested objects are indented; only the final one is flush left. Any scraper that stops at the first `}` truncates the JSON and reports "no verdict" — a bug that cost an hour here.
+</Callout>
+
+# HTTPS interception (/docs/interception)
+
+The goal is boring reliability: every app on the device, including Play Store and GMS, decrypts through mitmproxy, and apps that pin certificates still connect.
+
+## The chain [#the-chain]
+
+<Mermaid chart="flowchart LR\n  A[app] -->|CONNECT :18080| B[adb reverse tunnel]\n  B --> C[mitmdump :18080<br/>mitm/dump.py]\n  C --> D[upstream]\n  C -->|mitmproxy CA| A\n  E[Cert-Fixer<br/>post-fs-data] -.->|bind-mount CA| F[/apex/…/conscrypt/cacerts/]\n  F -.->|trust store| A" />
+
+1. **`adb reverse tcp:18080 tcp:18080`** — device port 18080 is the host's mitmdump. Survives nothing; re-established by `nettap on`.
+2. **Global proxy** `127.0.0.1:18080` (optional once `fspawn intercept` is in play).
+3. **CA trust** — the mitmproxy CA is installed as a *user* CA (`/data/misc/user/0/cacerts-added/<hash>.0`) and then mounted into the system trust store by **Cert-Fixer** at boot.
+4. **Capture** — `mitm/dump.py` writes one file per interesting flow.
+
+## The CA, exactly [#the-ca-exactly]
+
+```bash
+# hash used by the Android trust store (old subject hash, not the new one)
+openssl x509 -inform PEM -subject_hash_old -in ~/.mitmproxy/mitmproxy-ca-cert.pem | head -1
+# c8750f0d
+```
+
+Installed at `/data/misc/user/0/cacerts-added/c8750f0d.0`; Cert-Fixer copies and bind-mounts it into `/apex/com.android.conscrypt/cacerts` for every process, and does the same inside PID 1's mount namespace so late-started system services inherit it.
+
+Verify for a specific process:
+
+```bash
+PID=$(adb shell pidof com.google.android.gms | tr -d '\r')
+adb shell su -c "nsenter --mount=/proc/$PID/ns/mnt -- ls /apex/com.android.conscrypt/cacerts | wc -l"   # 150
+adb shell su -c "nsenter --mount=/proc/$PID/ns/mnt -- ls /apex/com.android.conscrypt/cacerts/c8750f0d.0"
+```
+
+<Callout type="info" title="Why AlwaysTrustUserCerts was not enough">
+That module only mounts in `service.sh`, i.e. **after** GMS and Play Store have already started, so they kept their original trust store and failed with `Client TLS handshake failed … does not trust the proxy's certificate for play-fe.googleapis.com`. Cert-Fixer hooks `post-fs-data` instead. It is installed, `trustusercerts` is disabled via `touch /data/adb/modules/trustusercerts/disable`.
+</Callout>
+
+## Pinning [#pinning]
+
+Two independent mechanisms, both from HTTP Toolkit's Frida scripts (`frida/httptoolkit/`), loaded by `fspawn <pkg> intercept`:
+
+- **`android-certificate-unpinning.js`** — hooks `TrustManagerImpl`, `OkHttp CertificatePinner`, `X509TrustManager` wrappers, Conscrypt and a long list of third-party pinning libraries, and makes them accept anything.
+- **`android-certificate-unpinning-fallback.js`** — a second pass that patches classes *after* they load, for apps that cache their trust managers early.
+
+Plus two scripts that make interception work without a system proxy:
+
+- **`android-proxy-override.js`** — rewrites `System.getProperty("http.proxyHost")`, `ConnectivityManager.getDefaultProxy()` and OkHttp's proxy selector.
+- **`native-connect-hook.js` / `native-tls-hook.js`** — LD_PRELOAD-style hooks (`connect`, `getaddrinfo`, `SSL_*`) so native code (Rust/Flutter/Go) also goes through the proxy and trusts our CA.
+
+Proof, reproducible on this device:
+
+```bash
+fspawn tech.httptoolkit.pinning_demo intercept
+# tap "OkHTTP pinned request" → the app reports success, and the flow shows up:
+# GET https://rsa8192--untrusted-root.testserver.host/ HTTP/2.0
+```
+
+Without the profile the same button says **Failed** and no flow appears.
+
+## What still resists [#what-still-resists]
+
+| Case | Symptom | Workaround |
+|---|---|---|
+| Certificate **transparency** enforcement | `SSL handshake failed` inside a pinned library, even with unpinning | Not solved here; needs a CT-aware proxy or hooking the CT verifier (`--ct` hooks in some forks) |
+| Mutual TLS with a hardware key | login fails at the TLS layer | Keys live in TEE; only TrickyStore-style keystore spoofing can help, and only for attestation, not arbitrary mTLS |
+| QUIC / HTTP/3 | app works, nothing captured | Disable QUIC in the app or block UDP 443 on the device; mitmproxy does not proxy QUIC |
+| WebSocket over `wss` | decrypted once upgraded | mitmproxy captures the upgrade; use the addon's `websocket_message` hook if you need frames |
+| Apps that pin inside a **WebView WebAssembly** module | nothing in Java hooks fires | hook the WebView's network stack (`fspawn web`) or fall back to `replay` with harvested tokens |
+
+## The addon [#the-addon]
+
+```bash
+cat ~/mobsec/mitm/dump.py
+```
+
+- `FLOWDIR` (default `/tmp/mtflows`), `INTEREST` (only matching URLs), `IGNORE` (default drops googleapis/gstatic/ggbn/firebase/app-measurement/crashlytics noise), `MAXBODY` (20000 bytes per body).
+- Output `<HHMMSS>_<host>_<path>.txt`, plus `_index.log` (human) and `_index.jsonl` (machine).
+- Restart after editing: `nettap off && nettap on`. mitmproxy does **not** hot-reload addons.
+
+## Sanity checks that catch most "interception is broken" reports [#sanity-checks-that-catch-most-interception-is-broken-reports]
+
+```bash
+pentestctl status | sed -n '/interception/,$p'
+curl -s -x 127.0.0.1:18080 -o /dev/null -w '%{http_code}\n' https://example.org   # 200
+grep -c 'does not trust the proxy' /tmp/mitm.log                                   # want 0 for GMS
+ls -t /tmp/mtflows/*.txt | head -3
+```
+
+# Quickstart (/docs/quickstart)
+
+Two paths: the device already exists (this laptop), or you are rebuilding it on a fresh machine.
+
+## Path A — the device already exists [#path-a--the-device-already-exists]
+
+```bash
+# 1. health check (start the emulator first if it is not running)
+~/Android/Sdk/emulator/emulator -avd pentest16 -no-snapshot -no-boot-anim &
+pentestctl status
+
+# 2. repair the two things a reboot always breaks
+pentestctl fix
+
+# 3. capture traffic
+nettap on
+# ... use the app ...
+ls -t /tmp/mtflows/*.txt | head
+
+# 4. instrument the app (Frida + pinning bypass + CA injection)
+fspawn com.example.app intercept
+
+# 5. WebView console/DOM/storage
+fdp com.example.app      # forwards :9222, prints the DevTools target
+cdp url                  # what page is loaded
+cdp eval "document.title"
+```
+
+<Callout type="idea" title="Fastest possible daily start">
+```bash
+snap load logged-in      # ~25 s instead of ~90 s cold boot
+pentestctl fix
+```
+`snap load` restores apps, sessions and cookies exactly as you left them. See [Snapshots](/docs/snapshots).
+</Callout>
+
+## Path B — rebuild from zero [#path-b--rebuild-from-zero]
+
+The full beginner walkthrough (SDK install, AVD tuning, rootAVD/Magisk UI clicks, module URLs, CA install, verification) lives in `GUIDE-from-scratch.md` in the repo root (open it directly, it is not part of this site). Short version:
+
+```bash
+cd ~/mobsec
+./bootstrap.sh --sdk        # host deps + SDK + AVD  (needs your sudo password once, for udev)
+emulator -avd pentest16 -no-snapshot &
+./fetch-deps.sh             # frida-server, jadx, apktool, scrcpy, rootAVD
+./rootAVD.sh …              # see GUIDE step 4 — interactive, Magisk UI driven over adb
+./install-device.sh         # modules, frida-server, zygisk policy
+./setup-keybox.sh           # fetch + validate a keybox, install to TrickyStore
+./setup-net.sh              # CA into the system store, proxy + tunnel
+pentestctl status
+```
+
+Order matters: `install-device.sh` reboots the device, `setup-net.sh` must run **after** the first boot with modules installed, and `setup-keybox.sh` last (it validates against the live device's TrickyStore path).
+
+<Callout type="warn" title="One interactive step cannot be scripted">
+Magisk's "install → patch image → additional setup → reboot" flow is UI-driven. `rootAVD.sh` pauses for it; the `GUIDE-from-scratch.md` section 4 walks the exact taps, and `uitap` can drive most of them by text.
+</Callout>
+
+## First real verification (5 minutes) [#first-real-verification-5-minutes]
+
+Do not trust a green `pentestctl status` alone — prove each layer with a request:
+
+| Layer | Command | Expected |
+|---|---|---|
+| Interception | `curl -s -x 127.0.0.1:18080 -o /dev/null -w '%{http_code}' https://example.org` | `200`, plus a new flow file |
+| System trust (GMS) | open Play Store, check `/tmp/mitm.log` | no `does not trust the proxy's certificate` |
+| Pinning bypass | `fspawn tech.httptoolkit.pinning_demo intercept` → tap "OkHTTP pinned request" | label says **Success**, request appears in flows |
+| Frida | `fspawn com.android.settings web` | `[fspawn] … scripts=2`, no exception spam |
+| WebView CDP | `fdp && cdp url` | the app's page URL |
+| Attestation | `KeyAttestation` app → "Attest key" | leaf issuer `O=TEE,CN=<deviceid>`, "Bootloader is locked" |
+
+## Sharing this site [#sharing-this-site]
+
+The site is served by MkDocs on the host. By default it listens on loopback only:
+
+```bash
+docs serve                 # http://127.0.0.1:8000/
+docs serve --lan           # http://<this-host-ip>:8000/ — phone, second laptop, whatever
+docs status                # what it is bound to, and every URL that answers
+```
+
+Two things have to be true for another device to load it:
+
+1. **It is bound to `0.0.0.0`**, not `127.0.0.1` (`docs serve --lan` does that; `docs status` shows the bind).
+2. **The host firewall lets the port in.** On a box with `ufw` enabled the default inbound policy is
+   `DROP`, so once:
+
+   ```bash
+   sudo ufw allow 8000/tcp
+   # narrower: sudo ufw allow from 192.168.0.0/24 to any port 8000 proto tcp
+   ```
+
+To keep it up permanently (survives logout/reboot, restarts on failure):
+
+```bash
+systemctl --user enable --now mobsec-docs        # unit in ~/.config/systemd/user/
+journalctl --user -u mobsec-docs -f
+```
+
+It is a plain MkDocs site: no auth, no TLS. Anyone on that network can read the whole rig, including
+which target you are testing — put it behind Tailscale or an SSH tunnel
+(`ssh -L 8000:127.0.0.1:8000 host`) if the network is not yours.
+
+## Where to go next [#where-to-go-next]
+
+- [Daily workflow](/docs/workflow) — the loop on a real engagement.
+- [Interception](/docs/interception) — why pinning bypass works, and what still fails.
+- [Troubleshooting](/docs/troubleshooting) — the eight traps, in the order they usually hit.
+
+# Rebuild from scratch (/docs/rebuild)
+
+Two artefacts describe a rebuild:
+
+- **`GUIDE-from-scratch.md`** — the narrative walkthrough (12 sections, beginner-friendly, includes the interactive Magisk UI steps and every download URL).
+- **`bootstrap.sh` / `fetch-deps.sh` / `install-device.sh` / `setup-keybox.sh` / `setup-net.sh`** — the automated path, in that order.
+
+## Automated path [#automated-path]
+
+```bash
+git clone <your copy> ~/mobsec && cd ~/mobsec
+
+./bootstrap.sh --sdk        # host deps, pipx tools, Android SDK, AVD creation, PATH block
+emulator -avd pentest16 -no-snapshot -no-boot-anim &
+./fetch-deps.sh             # frida-server (x86_64 + arm64), jadx, apktool, scrcpy, rootAVD
+# >>> root the image with rootAVD (interactive, see GUIDE §4) <<<
+./install-device.sh         # Magisk modules, frida-server staging, zygisk policy, reboot
+./setup-keybox.sh           # fetch + validate + install a keybox
+./setup-net.sh              # install mitm CA into the system store, proxy + tunnel
+pentestctl status
+```
+
+### Why the order is fixed [#why-the-order-is-fixed]
+
+| Step | Depends on | Fails if skipped |
+|---|---|---|
+| `bootstrap.sh` | — | no SDK/adb/emulator/AVD |
+| `fetch-deps.sh` | network | nothing to install downstream |
+| rootAVD | booted, unrooted device | `install-device.sh` aborts on missing `su` |
+| `install-device.sh` | root | no TrickyStore/PIF/Cert-Fixer/fsrv |
+| `setup-keybox.sh` | TrickyStore on device | attestation stays software/AOSP |
+| `setup-net.sh` | Cert-Fixer installed + one boot | user apps work, GMS/Play Store do not |
+
+`install-device.sh` finishes with a reboot; wait for `adb wait-for-device` before continuing.
+
+### What is interactive [#what-is-interactive]
+
+Only Magisk's first-run flow: *Install → Patch firmware/image → Select from storage → fakeboot.img → OK → additional setup → reboot*, plus granting `su` to shell. `GUIDE §4` has the exact taps; `uitap` can drive them by text, but expect to babysit it once.
+
+## Sharing the rig with a colleague [#sharing-the-rig-with-a-colleague]
+
+```bash
+zip -qr ~/share-zip/mobsec-rig-$(date +%Y%m%d).zip ~/mobsec \
+  -x '*/tools/jadx*' '*/tools/scrcpy*' '*/tools/apktool*' '*/tools/frida-server-*' \
+     '*/modules/MagiskFrida*' '*/modules/archive/*' '*/apks/*' '*/tools/medusa/.venv/*' \
+     '*/site/*' '*/.mobsec/*' '*/__pycache__/*'
+```
+
+Deliberately excluded, with reasons:
+
+| Excluded | Why |
+|---|---|
+| `keybox.xml`, `.pem`, `.p12` | key material; the recipient must fetch their own |
+| `~/.mobsec/session`, `~/.mitmproxy` | live cookies/tokens and your private CA |
+| AVD snapshots | 5 GB each, host-specific |
+| tool binaries (jadx, scrcpy, frida-server) | re-downloadable via `fetch-deps.sh`, keeps the zip ~25 MB |
+| `MagiskFrida-*.zip` | 141 MB, superseded by the `fsrv` module |
+
+The recipient still needs **their own** `adb` device and must run `setup-net.sh` so their mitmproxy CA (not ours) is installed. `SHARING.md` in the archive carries the exact run order and this table.
+
+## Verification after a rebuild [#verification-after-a-rebuild]
+
+```bash
+pentestctl status                                  # every section green
+frida-ps -U | head -3                              # 150+ processes
+curl -s -x 127.0.0.1:18080 -o /dev/null -w '%{http_code}\n' https://example.org   # 200
+fspawn tech.httptoolkit.pinning_demo intercept     # "OkHTTP pinned request - Success"
+recon com.android.settings --deep                  # recon sanity check
+snap save logged-in                                # your first restore point
+```
+
+## Version pinning that matters [#version-pinning-that-matters]
+
+| Component | Version | Why pinned |
+|---|---|---|
+| Magisk | 31.1 | Zygisk Next expects it; older Magisk has no `--sqlite` settings write |
+| Zygisk Next | 1.5.3-880 | later builds changed `zygiskd` flags |
+| frida-server | 17.27.5 | must match host `frida` exactly; 17.x removed `global`, changed `Module` API |
+| Frida host | 17.27.5 | mismatch = "unable to communicate with remote frida-server" |
+| PlayIntegrityFix | 4.9-inject-s | v19 has no x86_64 zygisk lib |
+| jadx | 1.5.7 | apkleaks shells out to it |
+| mitmproxy | 12.3.1 | addon uses `http.HTTPFlow` API (stable since 9) |
+
+When you bump a version, re-run the [verification list](#verification-after-a-rebuild) top to bottom before trusting the rig.
+
+# Static recon (/docs/recon)
+
+Dynamic testing tells you what the app *did*; static testing tells you what it *can* do. `recon` runs the static pass in one command and produces a report you can read in two minutes.
+
+## Usage [#usage]
+
+```bash
+recon /path/to/app.apk
+recon com.example.app --deep        # pulls base.apk from the device, then decompiles
+recon app.apk -o /tmp/out
+```
+
+Output:
+
+```text
+~/.mobsec/recon/<pkg>-<timestamp>/
+├── report.md            <- read this
+├── app.apk
+└── raw/
+    ├── badging.txt      aapt2 dump badging
+    ├── manifest.xml     apkanalyzer manifest print
+    ├── apkid.txt        packers / obfuscators / anti-analysis
+    ├── apkleaks.json    secrets + endpoints (+ .log)
+    ├── mobsfscan.json   SAST rules
+    └── endpoints.txt    only with --deep (jadx + grep)
+```
+
+## What the report contains, and how to read it [#what-the-report-contains-and-how-to-read-it]
+
+### Exported components [#exported-components]
+The attack surface that does not require the app to be running. For each component: `permission`, `actions`, `categories`, `data` (scheme/host/path/mime). Anything exported without a signature-level permission is worth a `adb shell am start` / `am broadcast` probe.
+
+### Packers / anti-analysis (APKiD) [#packers--anti-analysis-apkid]
+Read this with suspicion. APKiD matches library code too:
+
+| Tag | Meaning | What to do |
+|---|---|---|
+| `packer: …` | packer/obfuscator heuristic | decide whether to test the packed layer or the loader |
+| `anti_vm` / `anti_debug` | emulator/debugger checks | **verify by reading the class** before believing it |
+| `compiler: unknown` | not a real finding | ignore |
+
+Concrete example from this rig: Target was tagged `anti_vm` + `packer: DexGuard`, and every hit turned out to be library code:
+
+- `W0/c.java` → Firebase CCT metadata (`sdk-version`, `Build.MODEL`, `Build.FINGERPRINT`)
+- `p003a2/v.java` → Material `MaterialAutoCompleteTextView` (a Meizu hint workaround)
+- `p045n1/k.java` → GMS `DialogRedirect` logging
+- `p019g/A.java` → `!"robolectric".equals(Build.FINGERPRINT)`
+
+So: no app-level emulator check in the DEX. The `DexGuard` tag was R8 single-letter-package confusion. Ten minutes of reading beat a day of chasing a phantom.
+
+### Secrets / endpoints (apkleaks) [#secrets--endpoints-apkleaks]
+Categories with hit counts. Triage rules:
+
+- `Google_API_Key` / `Firebase` keys are **usually not secrets** — they are restricted by package name + SHA-1. Report only if a restriction test shows otherwise.
+- Random 30–40 char strings tagged `Artifactory_Password` are frequently obfuscation noise; grep the decompiled tree for the value before writing a finding.
+- Version strings (`1.0.0.2`) match `IP_Address`; ignore.
+- Real finds look like: hardcoded bearer tokens, private endpoints, staging hosts, cloud storage buckets.
+
+### SAST (mobsfscan) [#sast-mobsfscan]
+Rule-based Android checks (exported components, weak crypto, WebView settings, backup flags…). Fast, noisy, useful as a checklist. Zero findings is a valid result — not proof of safety.
+
+### Deep mode [#deep-mode]
+`--deep` decompiles with jadx (1.5.7) and greps string literals for URLs, then writes `endpoints.txt`. Use it to build the API list before you even launch the app; combine with the captured flows later.
+
+## A realistic order of operations [#a-realistic-order-of-operations]
+
+1. `recon com.example.app --deep` — components, permissions, endpoints, secrets.
+2. Note the **exported** components and any endpoint that looks internal (`/admin`, `/internal`, versioned staging hosts).
+3. Launch with `fspawn com.example.app web` (or `intercept`) and capture the real request set.
+4. Diff static endpoints vs captured endpoints: what the app *can* call but did not is where the interesting bugs live.
+5. Only then start `replay` fuzzing.
+
+## Extending it [#extending-it]
+
+`recon` is a shell script; every step is independent (`aapt2`, `apkanalyzer`, `apkid`, `apkleaks`, `mobsfscan`, `jadx`). Add steps by copying the pattern in `~/mobsec/bin/recon` — each writes into `raw/` and appends a section to `report.md`.
+
+Useful manual follow-ups it does not do:
+
+```bash
+# who signs it / is it debuggable
+apksigner verify --print-certs app.apk
+aapt2 dump xmltree app.apk --file AndroidManifest.xml | grep -i debuggable
+
+# backend fingerprinting from the flows
+jq -r 'select(.status>=400) | "\(.status) \(.method) \(.host)\(.path)"' /tmp/mtflows/_index.jsonl | sort | uniq -c | sort -rn | head
+```
+
+# Snapshots (/docs/snapshots)
+
+A cold boot costs ~90 seconds plus a login. A snapshot restore costs ~25 seconds and comes back to whatever state was saved — **including a logged-in app, if that is what you froze**.
+
+## Commands [#commands]
+
+```bash
+snap list                 # name, size, timestamp of newest file
+snap save                 # save as 'logged-in' (default)
+snap save before-fuzz     # named
+snap load                 # restore 'logged-in'
+snap load before-fuzz
+snap rm before-fuzz
+snap boot                 # cold boot, no snapshot
+```
+
+Under the hood:
+
+```bash
+adb emu avd snapshot save logged-in
+emulator -avd pentest16 -snapshot logged-in -no-snapshot-save -no-boot-anim
+```
+
+`-no-snapshot-save` is deliberate: when the emulator exits it would otherwise overwrite the snapshot with whatever half-broken state you were in.
+
+## What survives a restore [#what-survives-a-restore]
+
+| Survives | Does not survive |
+|---|---|
+| installed apps and their data | `adb reverse` tunnel (host-side) |
+| logged-in sessions/cookies in app storage | mitmdump process (host-side) |
+| Magisk modules + mount state | sometimes frida-server (`pentestctl fix` restarts it) |
+| keybox, target.txt | global proxy setting? (survives, but points at a dead tunnel) |
+
+That is why the documented restore sequence is:
+
+```bash
+snap load logged-in
+pentestctl fix          # re-establishes reverse + frida
+pentestctl status
+```
+
+## When a snapshot is a trap [#when-a-snapshot-is-a-trap]
+
+Snapshots capture **mount state**, so a snapshot taken while a module was broken keeps restoring the broken mount. Symptoms: Cert-Fixer log says it ran, but GMS still cannot TLS. Fix: cold boot (`snap boot`), verify, then `snap save` again under a new name.
+
+Rules:
+
+- After installing/removing a Magisk module or changing the CA, **cold boot once**, verify `pentestctl status` + a GMS request, then save a new snapshot.
+- Keep at most a handful: each is ~5 GB.
+- Name by intent (`logged-in`, `pre-fuzz`, `clean-no-modules`), not by date.
+- **A snapshot is only as logged-in as the moment you saved it.** After `keybox-refresh` rotates the
+  keybox, the device presents a new attestation identity on the next launch and the backend drops the
+  session — a snapshot saved before the rotation restores a logged-out app. Re-login (you need the
+  TOTP), then `snap save logged-in` again.
+
+<Callout type="warn" title="`snap save` refuses to work after `snap load`">
+`load`/`boot` start the emulator with `-no-snapshot-save` so a broken session cannot overwrite a
+good snapshot. The emulator reports the refusal as `UNSUPPORTED_VK_APP`, which looks like a GPU
+problem and is not. `snap save <name> --reopen` cold-boots keeping `/data`, then saves.
+</Callout>
+
+## Cost [#cost]
+
+| Action | Time | Disk |
+|---|---|---|
+| cold boot | ~90 s | — |
+| snapshot restore | ~21–25 s | — |
+| one snapshot | — | ~5.2 GB |
+
+# Live status (/docs/status)
+
+Snapshot taken **2026-11-24 20:10 IST** on the working rig. `pentestctl status` is the live truth — this page records what "green" looked like so you can tell drift from breakage.
+
+## Platform [#platform]
+
+| Item | Value |
+|---|---|
+| Device | `emulator-5554`, `sdk_gphone64_x86_64`, Android **16** (API 36), Play Store image |
+| AVD | `pentest16` — pixel_7 profile, 6 GB RAM, 4 vCPU, 16 GB data, KVM |
+| Fingerprint | `google/sdk_gphone64_x86_64/emu64xa:16/BE2A.250530.026.D1/13818094:user/release-keys` |
+| Root | Magisk **31.1** (`31.1:MAGISK:R`), `su` context `u:r:magisk:s0` |
+
+## Modules [#modules]
+
+| Module | Id | State |
+|---|---|---|
+| Zygisk Next 1.5.3 | `zygisksu` | inject_state=1, policy=default, enforce=1, memory=anonymous |
+| TrickyStore 1.4.1 | `tricky_store` | keybox from `RED-TEAM-KEYBOX` (DeviceID is a cosmetic upstream label), leaf valid until **2026-12-04** |
+| PlayIntegrityFix 4.9 | `playintegrityfix` | loaded (x86_64-safe build) — verdict still NO_INTEGRITY |
+| HMA-OSS | `hma_oss_zygisk` | loaded, **hide list empty** |
+| Cert-Fixer 1.1 | `cert-fixer` | CA mounted this boot (GMS + Play Store trust mitm) |
+| fsrv (ours) | `fsrv` | frida-server running as `hluda`, `127.0.0.1:27042` |
+| LSPosed (Vector) | `zygisk_vector` | loaded, no Xposed modules in use |
+
+## Host tools [#host-tools]
+
+| Tool | Version |
+|---|---|
+| frida / frida-tools | 17.27.5 |
+| mitmproxy | 12.3.1 (`:18080`, `connection_strategy=lazy`) |
+| jadx | 1.5.7 |
+| apktool | 3.0.3 (jar wrapper) |
+| apkid / apkleaks / mobsfscan | 3.2.0 / 2.6.3 / current |
+| objection | 1.12.5 |
+| scrcpy | 5.0.1 |
+| Android SDK | cmdline-tools latest, platform-tools, build-tools 36.0.0, platforms;android-36 |
+
+## Coverage at a glance [#coverage-at-a-glance]
+
+| Capability | State | Note |
+|---|---|---|
+| HTTPS interception, user apps | <StatusBadge variant="ok">working</StatusBadge> | 680+ flows captured |
+| HTTPS interception, GMS/Play Store | <StatusBadge variant="ok">working</StatusBadge> | fixed by Cert-Fixer (post-fs-data mount) |
+| Certificate pinning bypass | <StatusBadge variant="ok">working</StatusBadge> | verified against the OkHttp pinning demo |
+| Frida spawn + hooking | <StatusBadge variant="ok">working</StatusBadge> | 7 profiles, Java + native hooks |
+| WebView CDP | <StatusBadge variant="ok">working</StatusBadge> | `fdp` + `cdp` + `session` |
+| Key attestation spoofing | <StatusBadge variant="ok">working</StatusBadge> | server accepted login with a 5-cert RKP chain |
+| Root hiding (paths, memory, ports) | <StatusBadge variant="ok">working</StatusBadge> | anonymous memory, renamed agent |
+| Package-list hiding (HMA-OSS) | <StatusBadge variant="warn">not configured</StatusBadge> | hide list empty |
+| Play Integrity device verdict | <StatusBadge variant="bad">not possible here</StatusBadge> | emulator limitation; needs a physical device |
+| Certificate transparency-pinned apps | <StatusBadge variant="bad">unsupported</StatusBadge> | known gap |
+
+## Known-good invariants [#known-good-invariants]
+
+```text
+adb reverse --list               → host-16 tcp:18080 tcp:18080
+settings get global http_proxy   → 127.0.0.1:18080
+/data/adb/fsrv/ctl status        → running pid=<n> listen=127.0.0.1:27042
+zygiskd status                   → modules64: 3,zygisk_vector,hma_oss_zygisk,playintegrityfix
+magisk --denylist ls             → empty
+```
+
+If any of those drift, run `pentestctl fix` and read [Troubleshooting](/docs/troubleshooting).
+
+# Root hiding (/docs/stealth)
+
+Root is required for everything else here, so hiding it is a permanent tax. This rig hides the *mechanisms* (su binary, Magisk daemon, Zygisk libs, Frida) rather than trying to make a detector believe the device is unmodified — the attestation layer handles the "is this a real phone" question separately.
+
+## What is hidden, and how [#what-is-hidden-and-how]
+
+| Mechanism | Visibility | Mitigation in this rig |
+|---|---|---|
+| `su` binary / `magisk` | filesystem paths | Magisk's own mount/masking; app denylist empty so modules keep working |
+| Zygisk injection | `/proc/<pid>/maps`, dlopen paths | Zygisk Next `memory-type anonymous` → no file-backed libs |
+| Module mounts | `/proc/<pid>/mountinfo` | only whitelisted apps see them (default policy) |
+| Frida | process name, listening port, string `frida-server` | renamed `hluda`, loopback only, no default port on LAN |
+| Package enumeration | `getPackageInfo` / `queryIntentActivities` | HMA-OSS, scoped per target with `hma` |
+| Attestation | keystore chain | TrickyStore + keybox (see [Attestation](/docs/attestation)) |
+
+## Zygisk Next knobs [#zygisk-next-knobs]
+
+`/data/adb/modules/zygisksu/bin/zygiskd` is the control surface:
+
+```bash
+zygiskd status
+zygiskd enforce-denylist enabled      # honour Magisk's denylist
+zygiskd denylist-policy default       # default | whitelist
+zygiskd memory-type anonymous         # default | anonymous
+zygiskd disable-zygisk false
+```
+
+Current config (survives reboot):
+
+```text
+inject_state:1  denylist_policy:0 (default)  enforce_denylist:1  memory_type:1 (anonymous)
+modules64: 3,zygisk_vector,hma_oss_zygisk,playintegrityfix
+```
+
+### The whitelist trap [#the-whitelist-trap]
+
+`denylist-policy whitelist` means *only* listed packages get module injection — attractive for stealth, and it **breaks WebView apps**:
+
+```text
+WebView renderer (…:sandboxed_process0, isolated uid u0ai9000) does not match the package name
+→ no modules injected → no CA / no unpinning in the sandboxed renderer
+→ net_error -202 (SSL handshake failed) on every page
+```
+
+Verified and reverted. Keep `default`, and keep the app you are testing **out** of Magisk's denylist.
+
+## Magisk denylist: keep it empty [#magisk-denylist-keep-it-empty]
+
+```bash
+adb shell su -c 'magisk --denylist ls'      # expected: empty
+```
+
+If an app is in the denylist, Magisk strips module mounts from it — which is exactly where TrickyStore and PIF need to be. Hiding by denylisting is incompatible with spoofing. Choose one per app.
+
+## Traps [#traps]
+
+<Callout type="error" title="`magisk --denylist rm <pkg> <process>` segfaults the daemon">
+Two-argument form kills `magiskd`; afterwards `magisk -v` says
+`Cannot connect to daemon: Connection refused (os error 111)` and `su` is gone with it. Only a reboot recovers. Always pass a single package argument.
+</Callout>
+
+<Callout type="info" title="Magisk 31.1 removed 'Hide the Magisk app'">
+There is no stub-repackaging option in Settings and no CLI equivalent. Package-level hiding is HMA-OSS's job; keep that expectation straight when a detector lists installed packages.
+</Callout>
+
+## HMA-OSS: hiding packages from one app at a time [#hma-oss-hiding-packages-from-one-app-at-a-time]
+
+HMA-OSS (`hma_oss_zygisk`, manager `org.frknkrc44.hma_oss`) hooks package queries inside a chosen app and filters the answer. It is **scoped per target**: you say "when *this* app asks, act as if these packages do not exist".
+
+### The file that matters [#the-file-that-matters]
+
+```text
+/data/misc/hide_my_applist_bkpzksjqktswmspy/config.json
+```
+
+One JSON document, schema `configVersion: 95`, with a `scope` object keyed by target package. Each entry is an `AppConfig`:
+
+```json
+"com.example.target": {
+  "useWhitelist": false,
+  "excludeSystemApps": true,
+  "applyPresets": ["detector_apps","root_apps","shizuku_dhizuku","sus_apps","xposed"],
+  "applySettingsPresets": ["accessibility","dev_options"],
+  "extraSettings": {"settingsList": []},
+  "extraAppList": [], "extraOppositeAppList": []
+}
+```
+
+Preset names (they are the module's, not yours): apps = `accessibility_apps, custom_rom, detector_apps, root_apps, shizuku_dhizuku, sus_apps, xposed`; settings = `accessibility, dev_options, input_method`. The five app presets above are what you want against a root-detector: Magisk, KeyAttestation, Frida tooling, other test apps, Xposed-era leftovers.
+
+### Doing it from the host, not the UI [#doing-it-from-the-host-not-the-ui]
+
+```bash
+hma show                          # current scope entries
+hma hide com.example.target       # 5 app presets + 2 settings presets (defaults)
+hma hide com.example.target --presets root_apps,sus_apps --settings dev_options
+hma targets                       # what the scope currently names
+hma unhide com.example.target     # needs a reboot, see the trap below
+hma backup / hma restore          # snapshot the config before experiments
+```
+
+`hma` writes the config in place over `su`, so HMA's `FileObserver(configFile, CLOSE_WRITE or ATTRIB)` picks it up. Logcat then shows `(HMA-Service) Config loaded` (three times per write — `chmod` fires `ATTRIB` as well).
+
+<Callout type="error" title="Un-hiding does not take effect until you reboot">
+`HMAServiceDataHolder.shouldHideFromUid()` answers from a `uidHideCache` *before* it looks at the config, and only the manager-app pipe clears that cache — the file-reload path does not. Measured: `hma hide` on a live app works immediately (257 → 252 packages, Magisk hidden), `hma unhide` changes the file and nothing else. Reboot to un-hide.
+</Callout>
+
+<Callout type="warn" title="The manager app only saves on `onPause`">
+If you configure HMA in its UI and press Back, nothing is written — `AppSettingsV2Fragment` persists in `onPause`. Press HOME (or leave the app) to commit. This is why hand-editing `config.json` with `hma` is the less surprising path.
+</Callout>
+
+<Callout type="warn" title="A config.json created *after* boot is never watched">
+The `FileObserver` is constructed at boot even when the file is missing. If HMA has never written a config on this boot, your first `hma hide` needs one reboot before it has any effect. Check with `hma show` — if it is empty and you just created a scope, reboot, then re-apply.
+</Callout>
+
+## Verifying hiding actually works [#verifying-hiding-actually-works]
+
+**Measure with an app that declares `QUERY_ALL_PACKAGES`.** Without it, Android 11+ package-visibility filtering makes every app look clean:
+
+```text
+pm list packages                     → 255 packages
+Target getInstalledPackages(0)       → 91     (no QUERY_ALL_PACKAGES)
+pinning-demo getInstalledPackages(0) → 90     (no QUERY_ALL_PACKAGES)
+ApplistDetector (QUERY_ALL_PACKAGES) → 252/256 and Magisk visible or not
+```
+
+Use `apks/ApplistDetector.V2.4.apk` (`icu.nullptr.applistdetector`, Dr-TSNG) as the detector:
+
+```bash
+asu 'am start -n icu.nullptr.applistdetector/.MainActivity'
+# then read its "Installed apps" count and the Magisk/KeyAttestation rows
+```
+
+Measured on this rig, detector scoped, before vs after reboot:
+
+| state | installed count | `com.topjohnwu.magisk` |
+|---|---|---|
+| baseline, no scope | 256 | visible |
+| scoped + reboot | 252 | hidden |
+| live-added scope (Chrome) | 257 → 252 | visible → hidden, no reboot needed |
+
+HMA never hides a target app from itself, so the detector still lists `icu.nullptr.applistdetector` — that is correct behaviour, not a leak.
+
+Hiding does not disturb spoofing: after HMA was enabled, KeyAttestation still reported the keybox chain (`CN=Droid CA2, O=Google LLC`) and `Bootloader is locked`.
+
+```bash
+# module mounts visible to a normal app vs a module-injected app
+adb shell su -c 'wc -l < /proc/<settings-pid>/mountinfo'     # ~157
+adb shell su -c 'wc -l < /proc/<target-pid>/mountinfo'       # ~167 (10 module mounts)
+
+# no zygisk/tricky libs mapped
+adb shell su -c 'grep -cE "zygisk|tricky" /proc/<target-pid>/maps'   # 0
+```
+
+The 10-mount difference is the honest answer to "is injection scoped": non-target apps see zero module mounts.
+
+## What this does not hide [#what-this-does-not-hide]
+
+- **Emulator fingerprints** (`ro.kernel.qemu`, `goldfish` hardware, sensor set). Apps that check them are dealt with by `intercept`'s root/emulator detection bypass, not by this layer.
+- **A keybox that is revoked** — that is server-side truth, see [Attestation](/docs/attestation).
+- **Your traffic** — it leaves from the host's IP through mitmproxy.
+
+# Command reference (/docs/tooling)
+
+Everything is in `~/mobsec/bin` (already on `PATH`). All commands assume the emulator is running.
+
+## Health & control [#health--control]
+
+### `pentestctl` [#pentestctl]
+```bash
+pentestctl status     # device, root, zygisk, attestation (keybox expiry!), frida, interception
+pentestctl fix        # nettap on + restart frida-server; repairs reboot damage
+```
+Sections and what they read:
+
+| Section | Source of truth |
+|---|---|
+| device | `adb shell getprop` |
+| root | `su -c id`, `su -c magisk -v` |
+| zygisk | `zygiskd status` |
+| attestation | `/data/adb/tricky_store/{keybox.xml,target.txt}` + `kbcheck.py` |
+| frida | `/data/adb/fsrv/ctl status` |
+| interception | `/tmp/mitm.pid`, `adb reverse --list`, `settings get global http_proxy`, flow count, cert-fixer log |
+
+### `nettap` [#nettap]
+```bash
+nettap on [port]      # mitmdump (idempotent) + adb reverse + global proxy
+nettap off            # kill mitmdump, remove proxy/reverse
+nettap status         # proxy, reverse, pid, addon path, flow count
+```
+Env: `ADDON` (dump.py), `FLOWDIR`, `INTEREST`, `PORT`. `nettap on` refuses to start if the addon or `mitmdump` is missing instead of dying silently.
+
+### `snap` [#snap]
+```bash
+snap list             # snapshots + size + newest file mtime
+snap save [name]      # default 'logged-in'
+snap load [name]      # boots with -snapshot -no-snapshot-save (~25 s)
+snap rm [name]
+snap boot             # cold boot the AVD
+```
+
+## Frida [#frida]
+
+### `fspawn <pkg> [profile] [frida args…]` [#fspawn-pkg-profile-frida-args]
+Profiles: `trace` (default), `web`, `attest`, `spy`, `intercept`, `full`, `raw`. See [Frida](/docs/frida#profiles).
+```bash
+fspawn com.example.app intercept
+fspawn com.example.app raw -l ~/hooks.js
+```
+
+### `fdp [pkg] [port]` [#fdp-pkg-port]
+Finds `webview_devtools_remote_<pid>` in `/proc/net/unix` (auto-detects the foreground app when `pkg` is omitted), forwards `:9222`, prints the target list.
+
+### `cdp url|eval "<js>"|watch [secs]` [#cdp-urleval-jswatch-secs]
+Minimal CDP client (python3 + `websockets`). `eval` awaits promises; `watch` streams console/network events.
+
+### `session` [#session]
+```bash
+session            # harvest -> ~/.mobsec/session/<ts>.json + latest.json
+session show       # pretty-print
+session cookie     # just the Cookie header value
+```
+Merges `document.cookie`, `localStorage`, `sessionStorage` from the WebView with the newest flow's cookie header (httpOnly cookies are invisible to JS). `TARGET=target session` restricts the page match.
+
+### `medusa-export` [#medusa-export]
+```bash
+medusa-export list [filter]
+medusa-export export NAME... | --set core|web|dump
+medusa-export path NAME
+```
+
+## Traffic [#traffic]
+
+### `replay` [#replay]
+```bash
+replay --grep 'chat/loadInitialData' --session
+replay --grep X --patch 'a.b=42' --patch 'items[0].id=1' --dry
+replay --grep X --method POST --path /other --body '{"q":"x"}'
+replay --grep X --header 'x-test: 1' --remove-header cookie -x --full --save out.json
+```
+Defaults to exactly what the app sent (same headers, cookie, body). `-x` sends through mitmproxy (captured as evidence). `--save` writes the response body.
+
+### `recon` [#recon]
+```bash
+recon <apk|package> [--deep] [-o DIR]
+```
+Writes `~/.mobsec/recon/<pkg>-<ts>/report.md` + `raw/`. See [Static recon](/docs/recon).
+
+### `entry` [#entry]
+Turns the manifest into copy-paste attack commands — one `adb shell am start|broadcast|content` line per exported component and deep link.
+```bash
+entry com.example.app                 # attack sheet
+entry com.example.app --run            # and fire every probe
+entry com.example.app --only links -o /tmp/sheet.txt
+```
+The sheet lists exported activities/services/receivers with their required permissions, content providers (including `exported=false` + `grantUriPermissions=true`), every `scheme://host` deep link, and `pm get-app-links` state.
+
+### `pull-data` [#pull-data]
+The honest replacement for `adb backup` (blocked on API 31+): root-tars the app's private dir, pulls it, and summarises.
+```bash
+pull-data com.example.app                 # -> ~/.mobsec/data/<pkg>/
+pull-data com.example.app --sql           # + row counts for every sqlite db
+pull-data com.example.app --grep token    # grep the pull
+pull-data com.example.app --no-pull       # re-summarise only
+```
+Reports the biggest files, every SQLite database with tables/row counts, `shared_prefs` and JSON lines that look like secrets, and pulls `/sdcard/Android/data/<pkg>` too. Writes `summary.txt` next to the extracted tree.
+
+## Attestation, integrity and hiding [#attestation-integrity-and-hiding]
+
+### `setup-keybox.sh` / `keybox-refresh` [#setup-keyboxsh--keybox-refresh]
+```bash
+setup-keybox.sh --check                 # validate the installed keybox only
+setup-keybox.sh --file my-keybox.xml    # install a local one
+keybox-refresh [--force] [--min-days 7] [--dry-run]
+```
+`keybox-refresh` refreshes automatically only when the leaf is close to expiry or revoked, validates candidates with `kbcheck.py --strict`, and backs up the old keybox. It is wired to a systemd user timer. See [Attestation](/docs/attestation).
+
+### `hma` [#hma]
+Root-hiding scope editor for HMA-OSS (writes `config.json` over `su`, reloads live).
+```bash
+hma show
+hma hide com.example.app [--presets root_apps,sus_apps] [--settings dev_options]
+hma unhide com.example.app               # takes effect after a reboot
+hma backup / hma restore
+hma targets / hma presets
+```
+Un-hiding needs a reboot (uid cache); a `config.json` created *after* boot needs one reboot before it is watched. See [Root hiding](/docs/stealth).
+
+### `integrity` [#integrity]
+Play Integrity verdict from SPIC, scraped out of logcat.
+```bash
+integrity     # human-readable verdict
+integrity --json     # raw JSON
+```
+Expect `UNEVALUATED` on this AVD — it is Google declining to grade an emulator with no account, not a rig failure. See [Play Integrity](/docs/integrity).
+
+## Device helpers [#device-helpers]
+
+### `asu` [#asu]
+Runs a root shell snippet without the `adb shell su -c "…"` quoting nightmare:
+```bash
+asu 'for p in /data/adb/modules/*; do echo $p; done'
+```
+
+### `uitap` [#uitap]
+Text-driven UI automation (`uiautomator dump` under the hood) — survives layout changes that break fixed coordinates:
+```bash
+uitap dump
+uitap click "Login"
+uitap click "^Allow$" --exact
+uitap wait "Logged in" --timeout 20
+```
+
+### `apktool` [#apktool]
+Wrapper around the pinned `apktool_3.0.3.jar` (`apktool d app.apk -o out`).
+
+### `docs` [#docs]
+The documentation site you are reading, served locally.
+```bash
+docs serve            # mkdocs serve on 127.0.0.1:8000 (background, pid in /tmp/mkdocs.pid)
+docs serve --lan      # bind 0.0.0.0 so other machines can read it (needs a firewall rule, see below)
+docs build            # mkdocs build --strict
+docs status           # running? bound where? which URLs answer? firewall reminder
+docs open | docs stop
+```
+
+For permanent LAN sharing there is a user unit, `mobsec-docs.service`
+(`systemctl --user enable --now mobsec-docs`), and `sudo ufw allow 8000/tcp` once — `ufw`'s default
+inbound policy is `DROP`, so a bound port is not a reachable port.
+
+## Host environment [#host-environment]
+
+```bash
+java -version          # 21 (jadx/apktool/apkanalyzer)
+frida --version        # 17.27.5
+mitmdump --version     # 12.3.1
+apkid / apkleaks / mobsfscan / objection / scrcpy / adb / emulator
+python3 --version      # 3.12
+```
+
+## Cheat sheet [#cheat-sheet]
+
+```bash
+# the whole loop, one line each
+snap load logged-in && pentestctl fix
+nettap on
+recon com.example.app --deep
+fspawn com.example.app intercept
+fdp && cdp url
+session && replay --grep 'api/' --session --dry
+```
+
+# Troubleshooting (/docs/troubleshooting)
+
+Ordered by how often each one actually happens.
+
+## The five-minute triage [#the-five-minute-triage]
+
+```bash
+pentestctl status            # which section is red?
+pentestctl fix               # repairs reverse + frida
+adb devices                  # is the emulator even up?
+curl -s -x 127.0.0.1:18080 -o /dev/null -w '%{http_code}\n' https://example.org
+tail -20 /tmp/mitm.log
+```
+
+If `pentestctl status` is green but the app is silent, the problem is almost always **inside the app** (dead proxy in a cached connection, app not restarted, wrong package).
+
+## Symptom → cause [#symptom--cause]
+
+| Symptom | Most likely cause | Fix |
+|---|---|---|
+| App spins forever, zero flows | `adb reverse` died on reboot | `nettap on` |
+| Zero flows but `nettap status` says up | app cached a dead connection | force-stop + relaunch; `fspawn … intercept` |
+| GMS/Play Store TLS errors in `/tmp/mitm.log` | Cert-Fixer didn't run this boot | reboot, then `pentestctl status \| grep Cert-Fixer` |
+| `frida-ps` hangs or "unable to connect" | frida-server died | `adb shell su -c '/data/adb/fsrv/ctl start'` |
+| `Failed to spawn` but package installed | wrong package name / user profile | `adb shell pm list packages \| grep -i name` |
+| App crashes at startup under Frida | a script broke it | `fspawn <pkg> raw`, add scripts one at a time |
+| `net_error -202` on every WebView page | whitelist denylist policy | `zygiskd denylist-policy default` (see below) |
+| Attestation rejected (`4202`) after a keybox change | `target.txt` missing the package, or keybox revoked/expired | `pentestctl status \| grep keybox`, add package, force-stop app |
+| `magisk -v` → `Cannot connect to daemon` | daemon segfaulted by a two-arg `--denylist rm` | reboot |
+| Emulator won't boot after a bad snapshot | snapshot captured a broken mount | `snap boot` (cold), verify, `snap save <newname>` |
+| A command you rely on suddenly behaves differently | a `~/mobsec/bin` helper shadows it (PATH order) | `pentestctl status` → *host commands*; rename the helper |
+
+## Trap list (all hit for real here) [#trap-list-all-hit-for-real-here]
+
+### 1. `adb reverse` does not survive a reboot [#1-adb-reverse-does-not-survive-a-reboot]
+`settings put global http_proxy` **does**. Result: the app points at `127.0.0.1:18080` where nothing listens, and every request hangs with no error. `pentestctl fix` handles it.
+
+### 2. `frida … < /dev/null` exits instantly [#2-frida---devnull-exits-instantly]
+No tty → REPL dies. Use a fifo:
+```bash
+mkfifo /tmp/f; sleep 900 > /tmp/f &
+fspawn <pkg> intercept < /tmp/f > /tmp/frida.log 2>&1 &
+```
+
+### 3. `pkill -f` kills your own shell [#3-pkill--f-kills-your-own-shell]
+`pkill -f qemu-system` or `pkill -f 'frida -U -f pkg'` matches the `bash -c "<that command>"` wrapper and kills the invoking shell (exit 143). Record the PID and `kill <pid>`.
+
+### 4. `magisk --denylist rm <pkg> <process>` segfaults magiskd [#4-magisk---denylist-rm-pkg-process-segfaults-magiskd]
+Always one argument: `magisk --denylist rm <pkg>`. Recovery from the crash requires a reboot.
+
+### 5. Whitelist denylist policy breaks WebView renderers [#5-whitelist-denylist-policy-breaks-webview-renderers]
+`zygiskd denylist-policy whitelist` avoids injecting into non-listed apps, but renderer sandbox processes (`…:sandboxed_process0`, isolated uid) never match the package, so the CA and unpinning hooks are missing inside WebView → `SSL handshake failed; net_error -202`. Keep `default`.
+
+### 6. `adb shell su -c '…'` mangles quotes and loops [#6-adb-shell-su--c--mangles-quotes-and-loops]
+Multi-line snippets with `for`/`while` fail with `syntax error: unexpected 'do'`. Use `asu '…'`, which writes a script and runs it.
+
+### 7. Don't grep `/data/adb/modules/zygisksu/` recursively [#7-dont-grep-dataadbmoduleszygisksu-recursively]
+Its webroot has megabytes of i18n JSON and floods your terminal (and your context). Read specific files.
+
+### 8. mitmproxy does not hot-reload addons [#8-mitmproxy-does-not-hot-reload-addons]
+Edited `mitm/dump.py`? `nettap off && nettap on`, otherwise you keep the old behaviour (this is how a "fixed" filename bug appears unfixed).
+
+### 9. PlayIntegrityFork v19 is arm-only [#9-playintegrityfork-v19-is-arm-only]
+On x86_64 it silently never loads (`zygiskd status` stops listing `playintegrityfix`). Use the 4.9 x86_64 build.
+
+### 10. Medusa's `shared_preferences` module kills WebView apps [#10-medusas-shared_preferences-module-kills-webview-apps]
+`java.lang.NullPointerException … SharedPreferences$Editor.apply() on a null object reference` inside `WebViewChromiumFactoryProvider`. Not in any default profile.
+
+## Recovery runbook [#recovery-runbook]
+
+```bash
+# 1. device
+snap boot                     # or: snap load logged-in
+adb wait-for-device
+pentestctl status
+
+# 2. root/modules
+adb shell su -c 'zygiskd status'
+adb shell su -c 'cat /data/adb/tricky_store/target.txt'
+adb shell su -c 'grep -o "DeviceID=\"[^\"]*\"" /data/adb/tricky_store/keybox.xml'
+
+# 3. frida
+adb shell su -c '/data/adb/fsrv/ctl status' || adb shell su -c '/data/adb/fsrv/ctl start'
+frida-ps -U | head -3
+
+# 4. interception
+nettap on
+ls -t /tmp/mtflows/*.txt | head -2
+
+# 5. CA trust for system apps
+adb shell su -c 'tail -1 /data/local/tmp/cert-fixer.log'   # want "execution completed"
+```
+
+If step 5 is stale, reboot once — Cert-Fixer only mounts at `post-fs-data`.
+
+## Logs worth knowing [#logs-worth-knowing]
+
+| Log | What |
+|---|---|
+| `/tmp/mitm.log` | mitmdump stdout (`-v`), TLS failures, addon exceptions |
+| `/tmp/mtflows/_err.log` | addon write failures |
+| `/tmp/frida.log` | your `fspawn` output when run in background |
+| `/data/local/tmp/cert-fixer.log` | CA mount result per boot |
+| `adb logcat` | app crashes: `adb logcat -v time \| grep -iE 'AndroidRuntime\|FATAL'` |
+
+## When nothing makes sense [#when-nothing-makes-sense]
+
+Compare against a state you know worked:
+
+```bash
+snap load logged-in
+pentestctl fix
+fspawn tech.httptoolkit.pinning_demo intercept    # known-good pinning target
+```
+
+If the demo app also fails, the rig is broken. If only your target fails, the target has an additional defence — collect `fspawn … trace` output and read the `rootcheck`/`tls` lines before guessing.
+
+# Daily workflow (/docs/workflow)
+
+The loop that matters: **restore → verify → instrument → capture → replay → document.**
+
+## 1. Restore a known-good state [#1-restore-a-known-good-state]
+
+```bash
+snap load logged-in     # AVD snapshot: apps + logged-in session (~25 s)
+pentestctl fix          # adb reverse dies on reboot; mitm addon may be down
+pentestctl status       # read it, don't assume
+```
+
+If you changed anything device-wide (new module, new CA, new keybox), `snap save` a **new** snapshot name instead of overwriting `logged-in` — snapshots carry the mount state, and a stale snapshot can bring back a broken CA mount.
+
+## 2. Start the capture [#2-start-the-capture]
+
+```bash
+nettap on               # mitmdump + adb reverse + global proxy
+```
+
+`nettap on` is idempotent. For pinned apps you can even drop the global proxy afterwards (`adb shell settings put global http_proxy :0`) — `fspawn … intercept` redirects connections in-process, so capture continues.
+
+## 3. Instrument, don't guess [#3-instrument-dont-guess]
+
+```bash
+fspawn com.example.app intercept    # pinning + CA injection + root-detect off
+fspawn com.example.app trace        # core + rootcheck + TLS + WebView debug
+fspawn com.example.app spy          # stolen Medusa modules (anti-root, okhttp, sqlite)
+```
+
+Rules of thumb:
+
+- **WebView/Tauri/Cordova app?** You get 80% of the answer from `fdp` + `cdp eval` — DOM, storage, fetch wrappers, console. Do that before native hooking.
+- **Native pinning / keystore work?** `intercept` first, then `trace`, then `full`.
+- **Frida REPL needs a tty.** Backgrounded `frida` dies instantly if stdin is `/dev/null`; use a fifo (see [Frida](/docs/frida#background)).
+
+## 4. Capture what the app sends [#4-capture-what-the-app-sends]
+
+```bash
+ls -t /tmp/mtflows/*.txt | head -5
+cat "/tmp/mtflows/$(ls -t /tmp/mtflows | head -1)"
+python3 - <<'PY'
+import json
+rows=[json.loads(l) for l in open('/tmp/mtflows/_index.jsonl')]
+for r in rows[-12:]:
+    print(r['status'], r['method'], r['host']+r['path'][:70])
+PY
+```
+
+Flows are `<HHMMSS>_<host>_<path>.txt` with request headers/body and response headers/body, plus a machine-readable `_index.jsonl`. Full format: [Flows](/docs/flows).
+
+## 5. Replay with intent [#5-replay-with-intent]
+
+```bash
+session                                   # harvest cookies + localStorage from the WebView
+replay --grep 'chat/loadInitialData' --session
+replay --grep 'chat/loadInitialData' --session --patch 'conversationId="other-user"' --dry
+replay --grep 'auth/session' --patch 'userName="victim@corp"' -x
+```
+
+`--dry` prints the exact request without sending — use it every time before a `--patch`. `-x` sends through mitmproxy so the attempt is captured as evidence.
+
+## 6. Document as you go [#6-document-as-you-go]
+
+```bash
+recon com.example.app --deep      # static report first, before dynamic testing
+```
+
+Then write findings with the evidence pointer (`flow file`, `timestamp`, `endpoint`, `repro command`). A finding without a repro command is a rumour.
+
+## Session hygiene [#session-hygiene]
+
+- **One app at a time** on the emulator: `fdp` binds `:9222` and `fspawn` force-stops the package.
+- Check `pentestctl status` after any reboot; `adb reverse` is always the first casualty.
+- Long captures: `nettap status` prints flow count and the addon path, so you can tell "no traffic" from "addon not loaded".
+- Credentials and tokens: keep them in `~/.mobsec/session/` (never in the repo, never in a screenshot).
